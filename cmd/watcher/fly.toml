@@ -1,26 +1,28 @@
 # fly.toml — Solana on-chain price watcher
-# Deploy: fly deploy --config cmd/watcher/fly.toml
-# Secrets: fly secrets set DATABASE_URL=... RPC_ENDPOINT_SOLANA=... --config cmd/watcher/fly.toml
+# Deploy from repo root:  fly deploy --config cmd/watcher/fly.toml
+# Secrets:               fly secrets set DATABASE_URL="postgresql://..." --app onchain-watcher
 
 app = "onchain-watcher"
-primary_region = "ord"          # Chicago — low latency to Solana validators
+primary_region = "ord"
 
 [build]
-  dockerfile = "cmd/watcher/Dockerfile"
-  # Build context is the repo root so all internal packages are visible
+  # Dockerfile is at the repo root; build context must be the repo root.
+  # Run `fly deploy` from the repo root, NOT from cmd/watcher/.
+  dockerfile = "Dockerfile"
+
+  [build.args]
+    BUILD_TARGET = "cmd/watcher"
 
 [env]
-  # Non-secret defaults — override via `fly secrets set` for sensitive values
   RPC_ENDPOINT_SOLANA  = "https://api.mainnet-beta.solana.com/"
   RPC_ENDPOINT_BSC     = "https://bsc-dataseed.nariox.org/"
   RPC_ENDPOINT_BASE    = "https://mainnet.base.org/"
   TOKEN_ORDER_CACHE    = "/app/cache/token_order_cache.json"
 
-# DATABASE_URL must be set as a fly secret:
-#   fly secrets set DATABASE_URL="postgresql://..." --app onchain-watcher
+# DATABASE_URL must be set as a fly secret — never put it in this file.
+# Run once:  fly secrets set DATABASE_URL="postgresql://..." --app onchain-watcher
 
 [[services]]
-  # No HTTP port — this is a pure background worker
   internal_port = 8080
   protocol      = "tcp"
 
@@ -31,12 +33,8 @@ primary_region = "ord"          # Chicago — low latency to Solana validators
     restart_limit = 3
 
 [processes]
-  app = "/app/watcher"
+  app = "/app/run-app"
 
 [[mounts]]
   source      = "watcher_cache"
   destination = "/app/cache"
-
-[metrics]
-  port = 9091
-  path = "/metrics"

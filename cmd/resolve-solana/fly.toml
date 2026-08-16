@@ -1,28 +1,29 @@
 # fly.toml — Solana token-order resolver (scheduled job)
-# Deploy: fly deploy --config cmd/resolve-solana/fly.toml
-# Secrets: fly secrets set DATABASE_URL=... --config cmd/resolve-solana/fly.toml
+# Deploy from repo root:  fly deploy --config cmd/resolve-solana/fly.toml
+# Secrets:               fly secrets set DATABASE_URL="postgresql://..." --app onchain-resolver
 
 app = "onchain-resolver"
 primary_region = "ord"
 
 [build]
-  dockerfile = "cmd/resolve-solana/Dockerfile"
+  dockerfile = "Dockerfile"
+
+  [build.args]
+    BUILD_TARGET = "cmd/resolve-solana"
 
 [env]
   RPC_ENDPOINT_SOLANA = "https://api.mainnet-beta.solana.com/"
   TOKEN_ORDER_CACHE   = "/app/cache/token_order_cache.json"
-  # Runs every 15 minutes, picking up newly indexed pools.
-  # Set to "once" if you want a one-shot Machine instead.
   RESOLVE_INTERVAL    = "15m"
 
-# DATABASE_URL must be set as a fly secret:
-#   fly secrets set DATABASE_URL="postgresql://..." --app onchain-resolver
+# DATABASE_URL must be set as a fly secret — never put it in this file.
+# Run once:  fly secrets set DATABASE_URL="postgresql://..." --app onchain-resolver
 
 [processes]
-  app = "/app/resolver"
+  app = "/app/run-app"
 
 [[mounts]]
-  # Mount the SAME volume as the watcher so both share token_order_cache.json.
-  # Create it once: fly volumes create watcher_cache --region ord --size 1
+  # Same volume as the watcher — both share token_order_cache.json.
+  # Create once: fly volumes create watcher_cache --region ord --size 1 --app onchain-resolver
   source      = "watcher_cache"
   destination = "/app/cache"
