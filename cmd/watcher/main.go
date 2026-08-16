@@ -149,15 +149,36 @@ func main() {
 	log.Printf("BSC    WS shards: %d", len(bscWSEndpoints))
 	log.Printf("Base   WS shards: %d", len(baseWSEndpoints))
 
+	// Log whether DATABASE_URL was provided (without leaking the password)
+	if rawURL := strings.TrimSpace(os.Getenv("DATABASE_URL")); rawURL == "" {
+		log.Println("[db] WARNING: DATABASE_URL not set — using local fallback (will fail on fly.io)")
+	} else {
+		log.Printf("[db] DATABASE_URL is set (length=%d)", len(rawURL))
+	}
+	log.Printf("[db] connecting with DSN length=%d", len(dsn))
+
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("[db] sql.Open failed: %v", err)
 	}
 	defer db.Close()
-	if err := db.Ping(); err != nil {
-		log.Fatal(err)
+
+	// Retry db.Ping up to 5 times with backoff — fly.io internal DNS sometimes
+	// takes a few seconds to resolve on first boot.
+	connected := false
+	for attempt := 1; attempt <= 5; attempt++ {
+		if err := db.Ping(); err != nil {
+			log.Printf("[db] ping attempt %d/5 failed: %v — retrying in 3s", attempt, err)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		connected = true
+		break
 	}
-	log.Println("Connected to database")
+	if !connected {
+		log.Fatal("[db] could not connect to database after 5 attempts — check DATABASE_URL secret")
+	}
+	log.Println("[db] Connected to database")
 
 	// ── Adapters (HTTP) ───────────────────────────────────────────────────────
 	// Solana adapters are created on-the-fly per call in solanaFetch (round-robin)

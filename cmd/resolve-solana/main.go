@@ -63,14 +63,31 @@ func main() {
 		}
 	}
 
-	// Connect to DB.
+	// Connect to DB with retry — fly.io internal DNS can take a few seconds on boot.
+	if rawURL := strings.TrimSpace(os.Getenv("DATABASE_URL")); rawURL == "" {
+		log.Println("[resolve-solana] WARNING: DATABASE_URL not set — using local fallback (will fail on fly.io)")
+	} else {
+		log.Printf("[resolve-solana] DATABASE_URL is set (length=%d)", len(rawURL))
+	}
+
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		log.Fatalf("[resolve-solana] db open: %v", err)
 	}
 	defer db.Close()
-	if err := db.Ping(); err != nil {
-		log.Fatalf("[resolve-solana] db ping: %v", err)
+
+	connected := false
+	for attempt := 1; attempt <= 5; attempt++ {
+		if err := db.Ping(); err != nil {
+			log.Printf("[resolve-solana] db ping attempt %d/5 failed: %v — retrying in 3s", attempt, err)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		connected = true
+		break
+	}
+	if !connected {
+		log.Fatal("[resolve-solana] could not connect to database after 5 attempts — check DATABASE_URL secret")
 	}
 	log.Println("[resolve-solana] connected to database")
 
