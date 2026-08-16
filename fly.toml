@@ -1,41 +1,39 @@
-# fly.toml — onchain-fetcher
-# Single app, single image, two processes:
-#   app      — watcher runs continuously
-#   resolver — resolver runs on a 15-min schedule via fly cron
+# fly.toml app configuration file generated for onchain-fetcher on 2026-08-16T12:30:18Z
 #
-# ── First-time setup ──────────────────────────────────────
-# 1. Set the database secret (REQUIRED before first deploy):
-#      fly secrets set DATABASE_URL="postgresql://fly-user:PASS@direct.HOST.flympg.net/fly-db" --app onchain-fetcher
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
-# 2. Create the cache volume (once):
-#      fly volumes create fetcher_cache --region ord --size 1 --app onchain-fetcher
-#
-# 3. Deploy:
-#      fly deploy --app onchain-fetcher
-# ─────────────────────────────────────────────────────────
 
-app            = "onchain-fetcher"
-primary_region = "ord"
+app = 'onchain-fetcher'
+primary_region = 'ord'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  RPC_ENDPOINT_SOLANA = "https://api.mainnet-beta.solana.com/"
-  RPC_ENDPOINT_BSC    = "https://bsc-dataseed.nariox.org/"
-  RPC_ENDPOINT_BASE   = "https://mainnet.base.org/"
-  TOKEN_ORDER_CACHE   = "/app/cache/token_order_cache.json"
-  RESOLVE_INTERVAL    = "15m"
-
-# DATABASE_URL injected via:  fly secrets set DATABASE_URL="..." --app onchain-fetcher
+  RESOLVE_INTERVAL = '15m'
+  RPC_ENDPOINT_BASE = 'https://mainnet.base.org/'
+  RPC_ENDPOINT_BSC = 'https://bsc-dataseed.nariox.org/'
+  RPC_ENDPOINT_SOLANA = 'https://api.mainnet-beta.solana.com/'
+  TOKEN_ORDER_CACHE = '/app/cache/token_order_cache.json'
 
 [processes]
-  # Continuous WebSocket watcher
-  app      = "/app/watcher"
-  # Resolver runs alongside — it loops every 15m internally (RESOLVE_INTERVAL env)
-  resolver = "/app/resolver"
+  app = '/app/watcher'
+  resolver = '/app/resolver'
 
 [[mounts]]
-  source      = "fetcher_cache"
-  destination = "/app/cache"
-  # Both process groups share this volume for token_order_cache.json
+  source = 'fetcher_cache'
+  destination = '/app/cache'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 1024
