@@ -1,0 +1,40 @@
+# Compiled binaries
+*.exe
+*.out
+cmd.exe
+main.exe
+watcher.exe
+watcher_*.exe
+*.out
+
+# Runtime outputs
+*.jsonl
+sync_failures_*
+fetcher_run*.txt
+watcher_price_hits.jsonl
+token_order_cache.json
+
+# Env file with secrets — set via fly secrets instead
+.env
+
+# Temporary / debug scripts
+tmp_*
+check_*
+debug_*
+inspect_*
+export_*
+probe_*
+diagnose_*
+decode_*
+diag_*
+quick_*
+test_*.go
+verify_*.go
+temp_*
+
+# Python scripts
+*.py
+
+# Build artifacts
+*.tsbuildinfo
+dist/

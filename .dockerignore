@@ -1,0 +1,14 @@
+# Don't send these into the Docker build context
+*.exe
+*.jsonl
+*.csv
+*.json
+!go.mod
+!go.sum
+token_order_cache.json
+sync_failures_*
+fetcher_run*.txt
+watcher_price_hits.jsonl
+tmp_*
+*.out
+*.log
