@@ -385,39 +385,53 @@ func main() {
 	go pumpSwapWatcher.Start()
 	log.Println("Started program-level watchers: Raydium CLMM/CPMM + Orca + Pump.fun bonding curve")
 
-	// Fallback accountSubscribe watchers — covers Meteora DLMM/DAMM, Raydium AMM V4, Pump.fun AMM.
-	// IMPORTANT: exclude pools already covered by program-level logsSubscribe watchers.
-	// If a pool is handled by a program watcher (Raydium CLMM/CPMM, Orca, PumpSwap),
-	// including it here causes a race: both watchers fire on the same swap, the
-	// accountSubscribe HTTP fetch can return a wrong price and overwrite the correct
-	// event-based price. Filter them out.
-	programWatcherDEXes := map[string]bool{
-		"raydium clmm":  true,
-		"raydium-clmm":  true,
-		"raydium cpmm":  true,
-		"raydium-cpmm":  true,
-		"orca":          true,
-		"pumpswap":      true,
-		"pump-swap":     true,
-		"pump_swap":     true,
+	// ── Detect Raydium pool types (CPMM vs AMM V4) ───────────────────────────
+	// After the server migration, dex_name for CPMM = "Raydium CPMM" and
+	// AMM V4 = "Raydium AMM". But on first boot or before migration runs,
+	// some pools may still have dex_name = "raydium".
+	// Use DetectRaydiumProgram (on-chain owner probe) to authoritatively
+	// identify CPMM pools from any ambiguous "raydium" entries.
+	var confirmedCPMMPoolAddrs = make(map[string]bool)
+	var ambiguousRaydiumPairs []watcher.PairMeta
+	for _, p := range solanaPairs {
+		dexLower := strings.ToLower(strings.TrimSpace(p.DexName))
+		// Already clearly labelled — no probe needed
+		if strings.Contains(dexLower, "cpmm") {
+			confirmedCPMMPoolAddrs[strings.ToLower(p.PoolAddress)] = true
+			continue
+		}
+		// Plain "raydium" — ambiguous, needs on-chain probe
+		if dexLower == "raydium" {
+			ambiguousRaydiumPairs = append(ambiguousRaydiumPairs, p)
+		}
 	}
+	if len(ambiguousRaydiumPairs) > 0 {
+		log.Printf("[startup] Probing %d ambiguous 'raydium' pairs to detect CPMM vs AMM V4...", len(ambiguousRaydiumPairs))
+		cpmmPools, _, _ := watcher.DetectRaydiumProgram(ambiguousRaydiumPairs, solanaRPC)
+		for _, p := range cpmmPools {
+			confirmedCPMMPoolAddrs[strings.ToLower(p.PoolAddress)] = true
+		}
+		log.Printf("[startup] Detected %d CPMM pools from ambiguous set", len(cpmmPools))
+	}
+	log.Printf("[startup] Total CPMM pools excluded from accountSubscribe fallback: %d", len(confirmedCPMMPoolAddrs))
+
+	// Fallback accountSubscribe watchers — covers Meteora DLMM/DAMM, Raydium AMM V4, Pump.fun AMM.
+	// Exclude everything already covered by logsSubscribe program watchers:
+	//   - Raydium CLMM  (dex_name contains "clmm")
+	//   - Raydium CPMM  (dex_name contains "cpmm" OR confirmed by on-chain probe above)
+	//   - Orca          (dex_name contains "orca")
+	//   - PumpSwap      (dex_name contains "pump")
 	var fallbackPairs []watcher.PairMeta
 	for _, p := range solanaPairs {
 		dexLower := strings.ToLower(strings.TrimSpace(p.DexName))
-		coveredByProgram := false
-		for prefix := range programWatcherDEXes {
-			if strings.Contains(dexLower, prefix) {
-				coveredByProgram = true
-				break
-			}
-		}
-		// Also check by program ID matching: pumpswap contains "pump" but so does
-		// pump-fun AMM — pump-fun AMM has its own program watcher too, exclude it.
-		if strings.Contains(dexLower, "pumpswap") || strings.Contains(dexLower, "pump-fun") ||
-			strings.Contains(dexLower, "pumpfun") || strings.Contains(dexLower, "pump_fun") {
-			coveredByProgram = true
-		}
-		if !coveredByProgram {
+
+		covered := strings.Contains(dexLower, "clmm") ||
+			strings.Contains(dexLower, "cpmm") ||
+			strings.Contains(dexLower, "orca") ||
+			strings.Contains(dexLower, "pump") || // pumpswap, pump-fun, pumpfun
+			confirmedCPMMPoolAddrs[strings.ToLower(p.PoolAddress)]
+
+		if !covered {
 			fallbackPairs = append(fallbackPairs, p)
 		}
 	}
