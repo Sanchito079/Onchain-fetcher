@@ -91,6 +91,36 @@ func main() {
 	}
 	log.Println("[resolve-solana] connected to database")
 
+	// ── Startup diagnostics ───────────────────────────────────────────────────
+	// Log a quick summary of what's in the pairs table so we can verify
+	// the DB has the expected data before attempting resolution.
+	var totalPairs, solanaPairs int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM pairs`).Scan(&totalPairs)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM pairs WHERE network = 'solana'`).Scan(&solanaPairs)
+	log.Printf("[resolve-solana] DB summary: total_pairs=%d, solana_pairs=%d", totalPairs, solanaPairs)
+
+	// Show distinct dex names for Solana pairs so we know what's there
+	dexRows, err := db.Query(`
+		SELECT dex_name, COUNT(*) as cnt
+		FROM pairs
+		WHERE network = 'solana'
+		GROUP BY dex_name
+		ORDER BY cnt DESC
+		LIMIT 20
+	`)
+	if err == nil {
+		defer dexRows.Close()
+		log.Println("[resolve-solana] Solana dex breakdown:")
+		for dexRows.Next() {
+			var dexName string
+			var cnt int
+			if err := dexRows.Scan(&dexName, &cnt); err == nil {
+				log.Printf("[resolve-solana]   %-30s %d pairs", dexName, cnt)
+			}
+		}
+	}
+	// ─────────────────────────────────────────────────────────────────────────
+
 	// Load the persistent cache (may already have entries from previous runs).
 	cache := watcher.NewTokenOrderCache(cachePath)
 	log.Printf("[resolve-solana] cache loaded: %d existing entries from %s",

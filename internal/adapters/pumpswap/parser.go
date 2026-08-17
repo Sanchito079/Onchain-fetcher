@@ -98,32 +98,38 @@ func parsePumpSwapAccountData(raw []byte) (*big.Int, *big.Int, error) {
 }
 
 func parsePumpSwapAccountDataWithRPC(raw []byte, pool, baseToken, quoteToken string, getAccountInfo func(string) ([]byte, error), getTokenAccountsByOwner func(string) ([]TokenAccountInfo, error)) (*big.Int, *big.Int, error) {
+    // Priority 1: Read the pool's embedded base/quote token account pubkeys at
+    // the fixed layout offsets and fetch their balances. This is the most reliable
+    // path — it uses the deterministic pool layout, not byte scanning.
     if getAccountInfo != nil {
         if reserveA, reserveB, err := parseReserveTokenAccountsFromPool(raw, getAccountInfo); err == nil {
             return reserveA, reserveB, nil
         }
     }
 
+    // Priority 2: Query all token accounts owned by the pool and align by mint.
+    // More RPC calls but still deterministic — no raw byte scanning.
     if getTokenAccountsByOwner != nil {
         if reserveA, reserveB, err := parseReserveTokenAccountsByOwner(pool, baseToken, quoteToken, getTokenAccountsByOwner); err == nil {
             return reserveA, reserveB, nil
         }
     }
 
+    // Priority 3: Candidate address resolution using mint alignment (no raw uint64 scan).
+    if getAccountInfo != nil {
+        if reserveA, reserveB, err := parseReserveTokenAccounts(raw, baseToken, quoteToken, getAccountInfo); err == nil {
+            return reserveA, reserveB, nil
+        }
+    }
+
+    // Last resort: raw byte scanning. Unreliable — random uint64 pairs can satisfy
+    // isValidReservePair and produce incorrect prices. Only reached when all
+    // RPC-based methods fail (e.g. no network access in tests).
     if reserveA, reserveB, err := parsePumpSwapAccountData(raw); err == nil {
         return reserveA, reserveB, nil
     }
 
-    if getAccountInfo == nil {
-        return nil, nil, fmt.Errorf("unable to parse PumpSwap account data from %d bytes", len(raw))
-    }
-
-    reserveA, reserveB, err := parseReserveTokenAccounts(raw, baseToken, quoteToken, getAccountInfo)
-    if err == nil {
-        return reserveA, reserveB, nil
-    }
-
-    return nil, nil, err
+    return nil, nil, fmt.Errorf("unable to parse PumpSwap reserves for pool %s: all methods failed", pool)
 }
 
 func parseReserveTokenAccountsFromPool(raw []byte, getAccountInfo func(string) ([]byte, error)) (*big.Int, *big.Int, error) {

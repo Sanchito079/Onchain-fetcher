@@ -410,6 +410,8 @@ func (w *ProgramWatcher) priceFromEventData(data []byte, pair PairMeta) float64 
 			pair.BaseToken, pair.QuoteToken)
 	case ProgramPumpFunAMM:
 		return priceFromPumpFunAMMEvent(data, pair.BaseTokenDecimals, pair.QuoteTokenDecimals)
+	case ProgramPumpSwap:
+		return priceFromPumpSwapEvent(data, pair.BaseTokenDecimals, pair.QuoteTokenDecimals, pair.BaseToken, pair.QuoteToken)
 	default:
 		// Meteora DLMM, DAMM, DAMM v2 don't emit events — handled by accountSubscribe fallback
 		return 0
@@ -703,17 +705,17 @@ func priceFromDammV2Event(data []byte, baseDecimals, quoteDecimals int, baseToke
 // priceFromPumpSwapEvent reads reserve balances from the PumpSwap swap event blob
 // and computes price as a ratio. Zero HTTP calls.
 //
-// PumpSwap SwapEvent layout (from inspector output):
+// PumpSwap SwapEvent layout (from inspector output — verified against 3 live events):
 //   [0:8]    discriminator [189, 219, 127, 211, 78, 230, 97, 238]
 //   [8:40]   pool_id: pubkey
-//   [40:48]  reserve0: u64  ← vault balance at offset 40 (raw atomic units)
-//   [48:56]  reserve1: u64  ← vault balance at offset 48 (raw atomic units)
-//   ... (remaining fields not needed for price calculation)
+//   [40:48]  reserve0: u64  ← pool base token reserve (raw atomic units)
+//   [48:56]  reserve1: u64  ← pool quote token reserve (raw atomic units)
 //
-// Price = reserve1 / reserve0 adjusted for decimals.
-// Since we don't have mint addresses in the event to determine orientation,
-// we try both orientations and use ChooseSanePrice to pick the reasonable one.
-func priceFromPumpSwapEvent(data []byte, baseDecimals, quoteDecimals int) float64 {
+// The event does not contain mint addresses, so we cannot determine orientation
+// from the event bytes alone. We use the pair's token addresses from the DB to
+// disambiguate when the HTTP adapter has already resolved them, and fall back
+// to ChooseSanePrice when they are not available.
+func priceFromPumpSwapEvent(data []byte, baseDecimals, quoteDecimals int, baseToken, quoteToken string) float64 {
 	// Need at least 56 bytes to read both reserves
 	if len(data) < 56 {
 		return 0
@@ -725,12 +727,11 @@ func priceFromPumpSwapEvent(data []byte, baseDecimals, quoteDecimals int) float6
 		return 0
 	}
 
-	// Try both orientations since we don't know which reserve is base vs quote
-	// direct: assume reserve1 is quote, reserve0 is base → price = reserve1/reserve0
+	// direct: reserve0=base, reserve1=quote → price = (reserve1/10^quoteDecimals) / (reserve0/10^baseDecimals)
 	direct := vaultRatioToPrice(reserve1, reserve0, quoteDecimals, baseDecimals)
-	// inverse: assume reserve0 is quote, reserve1 is base → price = reserve0/reserve1
+	// inverse: reserve0=quote, reserve1=base → price = (reserve0/10^quoteDecimals) / (reserve1/10^baseDecimals)
 	inverse := vaultRatioToPrice(reserve0, reserve1, quoteDecimals, baseDecimals)
-	
+
 	price := shared.ChooseSanePrice(direct, inverse)
 	if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
 		return 0

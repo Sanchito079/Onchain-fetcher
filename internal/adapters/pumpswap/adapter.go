@@ -84,13 +84,18 @@ func (a Adapter) FetchPrice(pair shared.Pair) (shared.PriceResult, error) {
     }, func(owner string) ([]TokenAccountInfo, error) {
         return a.RPC.getTokenAccountsByOwner(owner)
     })
-    // If parsing succeeded, attempt to realign reserves by mint when possible.
+    // If the fixed-offset token-account parse succeeded, attempt to realign
+    // reserves by mint so base/quote ordering is always correct.
+    // Only overwrite if mint alignment actually resolves both tokens — never
+    // fall through to the candidate byte-scan when we already have valid reserves.
     if err == nil {
         if mintMap, merr := parseReserveTokenAccountsByMint(data, func(acc string) ([]byte, error) { return a.RPC.getAccountInfo(acc) }); merr == nil {
             if baseReserve, quoteReserve, ok := orderReservesByTokenMetadata(mintMap, pair.BaseToken, pair.QuoteToken); ok {
                 reserve0 = baseReserve
                 reserve1 = quoteReserve
             }
+            // If mint alignment couldn't match our tokens, keep the existing
+            // reserve0/reserve1 from parseReserveTokenAccountsFromPool — don't guess.
         }
     }
     var directPrice, invertedPrice, price float64

@@ -124,7 +124,15 @@ func main() {
 	}
 
 	// ── BSC endpoints ─────────────────────────────────────────────────────────
-	bscRPC := getEnv("RPC_ENDPOINT_BSC", "https://smart-sly-voice.bsc.quiknode.pro/68e23973e7772747604cc40a754b8349c20db22c/")
+	// HTTP: round-robin across multiple endpoints — mirrors the Solana pattern.
+	// Primary is QuickNode; fallbacks are public nodes for resilience.
+	bscHTTPEndpoints := []string{
+		getEnv("RPC_ENDPOINT_BSC", "https://smart-sly-voice.bsc.quiknode.pro/68e23973e7772747604cc40a754b8349c20db22c/"),
+		"https://bsc-dataseed.nariox.org/",
+		"https://bsc-dataseed1.defibit.io/",
+		"https://bsc-dataseed1.ninicoin.io/",
+		"https://bsc.drpc.org",
+	}
 	bscWSEndpoints := []string{
 		"wss://bsc-mainnet.infura.io/ws/v3/a3830c325e5f45d78770301a768c6339",
 		"wss://bsc-mainnet.infura.io/ws/v3/0a3026fd58c745bf8836a13e1f56d3fb",
@@ -134,7 +142,14 @@ func main() {
 	}
 
 	// ── Base endpoints ────────────────────────────────────────────────────────
-	baseRPC := getEnv("RPC_ENDPOINT_BASE", "https://palpable-divine-shape.base-mainnet.quiknode.pro/6bbce19b5765801546265b33f2d1fdb2aafa9cc8/")
+	// HTTP: round-robin across multiple endpoints.
+	// Primary is QuickNode; fallbacks are public Base nodes.
+	baseHTTPEndpoints := []string{
+		getEnv("RPC_ENDPOINT_BASE", "https://palpable-divine-shape.base-mainnet.quiknode.pro/6bbce19b5765801546265b33f2d1fdb2aafa9cc8/"),
+		"https://mainnet.base.org",
+		"https://base.drpc.org",
+		"https://base-rpc.publicnode.com",
+	}
 	baseWSEndpoints := []string{
 		"wss://base-mainnet.infura.io/ws/v3/9df9281ff02b4bd4b446bf1744a69f84",
 		"wss://base-mainnet.infura.io/ws/v3/e305c7c893eb48bd8de255d3c32548c1",
@@ -145,9 +160,9 @@ func main() {
 	if ep := strings.TrimSpace(os.Getenv("RPC_WS_BASE_3")); ep != "" { baseWSEndpoints[2] = ep }
 
 	log.Printf("=== Multi-Chain Price Watcher ===")
-	log.Printf("Solana WS shards: %d", len(solanaWSEndpoints))
-	log.Printf("BSC    WS shards: %d", len(bscWSEndpoints))
-	log.Printf("Base   WS shards: %d", len(baseWSEndpoints))
+	log.Printf("Solana WS shards: %d  HTTP endpoints: %d", len(solanaWSEndpoints), len(solanaHTTPEndpoints))
+	log.Printf("BSC    WS shards: %d  HTTP endpoints: %d", len(bscWSEndpoints), len(bscHTTPEndpoints))
+	log.Printf("Base   WS shards: %d  HTTP endpoints: %d", len(baseWSEndpoints), len(baseHTTPEndpoints))
 
 	// Log whether DATABASE_URL was provided (without leaking the password)
 	if rawURL := strings.TrimSpace(os.Getenv("DATABASE_URL")); rawURL == "" {
@@ -181,21 +196,11 @@ func main() {
 	log.Println("[db] Connected to database")
 
 	// ── Adapters (HTTP) ───────────────────────────────────────────────────────
-	// Solana adapters are created on-the-fly per call in solanaFetch (round-robin)
-	basePancake    := pancakeswap.Adapter{RPC: pancakeswap.RPCClient{Endpoint: baseRPC}}
-	bscPancake     := pancakeswap.Adapter{RPC: pancakeswap.RPCClient{Endpoint: bscRPC}}
-	baseUniswap    := uniswap.Adapter{RPC: uniswap.RPCClient{Endpoint: baseRPC}}
-	bscUniswap     := uniswap.Adapter{RPC: uniswap.RPCClient{Endpoint: bscRPC}}
-	baseSlipstream := slipstream.Adapter{RPC: slipstream.RPCClient{Endpoint: baseRPC}}
+	// EVM adapters are created on-the-fly per call in evmFetch (round-robin),
+	// mirroring the Solana pattern. No single-endpoint adapters are pre-built.
 
 	// ── Step 1: Initial sync — all chains (DISABLED) ──────────────────────────
 	// HTTP polling disabled in favor of real-time WebSocket watchers only
-	// log.Println("Running initial full sync...")
-	// os.Setenv("SYNC_NETWORK_FILTER", "all")
-	// syncer := sync.NewSyncer(db)
-	// if err := syncer.SyncOnce(); err != nil {
-	//     log.Printf("Initial sync error (continuing): %v", err)
-	// }
 	log.Println("HTTP polling DISABLED — using WebSocket watchers only")
 
 	// ── Step 2: Solana fetch function with round-robin HTTP load balancing ────
@@ -229,19 +234,34 @@ func main() {
 		return result.Price, nil
 	}
 
-	// ── Step 3: EVM fetch function ────────────────────────────────────────────
+	// ── Step 3: EVM fetch function with round-robin HTTP load balancing ───────
+	// Same pattern as Solana: each chain has its own endpoint slice and counter.
+	// On every swap event that needs an HTTP fallback, picks the next endpoint.
+	var bscRPCIdx, baseRPCIdx int64
 	evmFetch := func(pair shared.Pair) (float64, error) {
 		dex := strings.ToLower(pair.DexName)
 		network := strings.ToLower(pair.Network)
+
+		// Pick endpoint round-robin per chain
+		var endpoint string
+		if network == "base" {
+			idx := int(atomic.AddInt64(&baseRPCIdx, 1)-1) % len(baseHTTPEndpoints)
+			endpoint = baseHTTPEndpoints[idx]
+		} else {
+			idx := int(atomic.AddInt64(&bscRPCIdx, 1)-1) % len(bscHTTPEndpoints)
+			endpoint = bscHTTPEndpoints[idx]
+		}
+
+		// Build adapter on-the-fly with the selected endpoint
 		var result shared.PriceResult
 		var fetchErr error
 		switch {
 		case strings.Contains(dex, "uniswap"):
-			if network == "base" { result, fetchErr = baseUniswap.FetchPrice(pair) } else { result, fetchErr = bscUniswap.FetchPrice(pair) }
+			result, fetchErr = uniswap.Adapter{RPC: uniswap.RPCClient{Endpoint: endpoint}}.FetchPrice(pair)
 		case strings.Contains(dex, "slipstream") || strings.Contains(dex, "aerodrome"):
-			result, fetchErr = baseSlipstream.FetchPrice(pair)
+			result, fetchErr = slipstream.Adapter{RPC: slipstream.RPCClient{Endpoint: endpoint}}.FetchPrice(pair)
 		default:
-			if network == "base" { result, fetchErr = basePancake.FetchPrice(pair) } else { result, fetchErr = bscPancake.FetchPrice(pair) }
+			result, fetchErr = pancakeswap.Adapter{RPC: pancakeswap.RPCClient{Endpoint: endpoint}}.FetchPrice(pair)
 		}
 		if fetchErr != nil { return 0, fetchErr }
 		if !result.Valid { return 0, fmt.Errorf("invalid: %s", result.Reason) }
