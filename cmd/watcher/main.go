@@ -385,11 +385,48 @@ func main() {
 	go pumpSwapWatcher.Start()
 	log.Println("Started program-level watchers: Raydium CLMM/CPMM + Orca + Pump.fun bonding curve")
 
-	// Fallback accountSubscribe watchers — covers Meteora DLMM/DAMM, Raydium AMM V4, Pump.fun AMM
-	// These programs don't emit usable logsSubscribe events so we subscribe per-pool
+	// Fallback accountSubscribe watchers — covers Meteora DLMM/DAMM, Raydium AMM V4, Pump.fun AMM.
+	// IMPORTANT: exclude pools already covered by program-level logsSubscribe watchers.
+	// If a pool is handled by a program watcher (Raydium CLMM/CPMM, Orca, PumpSwap),
+	// including it here causes a race: both watchers fire on the same swap, the
+	// accountSubscribe HTTP fetch can return a wrong price and overwrite the correct
+	// event-based price. Filter them out.
+	programWatcherDEXes := map[string]bool{
+		"raydium clmm":  true,
+		"raydium-clmm":  true,
+		"raydium cpmm":  true,
+		"raydium-cpmm":  true,
+		"orca":          true,
+		"pumpswap":      true,
+		"pump-swap":     true,
+		"pump_swap":     true,
+	}
+	var fallbackPairs []watcher.PairMeta
+	for _, p := range solanaPairs {
+		dexLower := strings.ToLower(strings.TrimSpace(p.DexName))
+		coveredByProgram := false
+		for prefix := range programWatcherDEXes {
+			if strings.Contains(dexLower, prefix) {
+				coveredByProgram = true
+				break
+			}
+		}
+		// Also check by program ID matching: pumpswap contains "pump" but so does
+		// pump-fun AMM — pump-fun AMM has its own program watcher too, exclude it.
+		if strings.Contains(dexLower, "pumpswap") || strings.Contains(dexLower, "pump-fun") ||
+			strings.Contains(dexLower, "pumpfun") || strings.Contains(dexLower, "pump_fun") {
+			coveredByProgram = true
+		}
+		if !coveredByProgram {
+			fallbackPairs = append(fallbackPairs, p)
+		}
+	}
+	log.Printf("Fallback accountSubscribe: %d/%d pairs (excluded %d covered by program watchers)",
+		len(fallbackPairs), len(solanaPairs), len(solanaPairs)-len(fallbackPairs))
+
 	fallbackSolanaWatchers := watcher.NewShardedWatchers(
 		solanaWSEndpoints,
-		db, solanaPairs,
+		db, fallbackPairs,
 		func(poolAddress string, pair shared.Pair) (float64, error) {
 			price, err := solanaFetch(poolAddress, pair)
 			src := "http"
