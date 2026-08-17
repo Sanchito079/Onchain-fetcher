@@ -740,39 +740,37 @@ func priceFromPumpSwapEvent(data []byte, baseDecimals, quoteDecimals int, baseTo
 }
 
 // priceFromPumpFunAMMEvent reads pool reserve balances from the Pump.fun AMM swap event.
-// 
-// Pump.fun AMM SwapEvent layout (from Solscan):
+//
+// Pump.fun AMM BuyEvent/SellEvent layout (from official IDL — pAMMBay6oceH9...):
 //   [0:8]     discriminator
-//   [8:40]    pool: pubkey
-//   [40:48]   timestamp: i64
-//   [48:56]   baseAmountOut: u64
-//   [56:64]   maxQuoteAmountIn: u64
-//   [64:72]   userBaseTokenReserves: u64
-//   [72:80]   userQuoteTokenReserves: u64
-//   [80:88]   poolBaseTokenReserves: u64  ← POST-SWAP pool base reserves
-//   [88:96]   poolQuoteTokenReserves: u64 ← POST-SWAP pool quote reserves
-//   ... (remaining fields)
+//   [8:16]    timestamp: i64
+//   [16:24]   baseAmountOut: u64         (for BuyEvent) / baseAmountIn (for SellEvent)
+//   [24:32]   maxQuoteAmountIn: u64      (for BuyEvent) / minQuoteAmountOut (for SellEvent)
+//   [32:40]   userBaseTokenReserves: u64  ← user wallet balance (NOT the pool)
+//   [40:48]   userQuoteTokenReserves: u64 ← user wallet balance (NOT the pool)
+//   [48:56]   poolBaseTokenReserves: u64  ← POST-SWAP pool base reserves  ✓
+//   [56:64]   poolQuoteTokenReserves: u64 ← POST-SWAP pool quote reserves ✓
 //
 // Price = poolQuoteTokenReserves / poolBaseTokenReserves adjusted for decimals.
+// Both BuyEvent and SellEvent have the same layout at these offsets.
 func priceFromPumpFunAMMEvent(data []byte, baseDecimals, quoteDecimals int) float64 {
-	// Need at least 96 bytes to read both pool reserves
-	if len(data) < 96 {
+	// Need at least 64 bytes to read both pool reserves
+	if len(data) < 64 {
 		return 0
 	}
 
-	poolBaseReserves := binary.LittleEndian.Uint64(data[80:88])
-	poolQuoteReserves := binary.LittleEndian.Uint64(data[88:96])
-	
+	// Pool reserves are at offsets 48 and 56 (verified against IDL)
+	poolBaseReserves  := binary.LittleEndian.Uint64(data[48:56])
+	poolQuoteReserves := binary.LittleEndian.Uint64(data[56:64])
+
 	if poolBaseReserves == 0 || poolQuoteReserves == 0 {
 		return 0
 	}
 
-	// Price = poolQuoteReserves / poolBaseReserves, adjusted for decimals
-	// Try both orientations in case we have the orientation wrong
-	direct := vaultRatioToPrice(poolQuoteReserves, poolBaseReserves, quoteDecimals, baseDecimals)
-	inverse := vaultRatioToPrice(poolBaseReserves, poolQuoteReserves, baseDecimals, quoteDecimals)
-	
-	price := shared.ChooseSanePrice(direct, inverse)
+	// price = poolQuoteReserves / poolBaseReserves adjusted for decimals
+	// The IDL explicitly names these poolBaseTokenReserves and poolQuoteTokenReserves
+	// so orientation is unambiguous — no ChooseSanePrice needed.
+	price := vaultRatioToPrice(poolQuoteReserves, poolBaseReserves, quoteDecimals, baseDecimals)
 	if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
 		return 0
 	}

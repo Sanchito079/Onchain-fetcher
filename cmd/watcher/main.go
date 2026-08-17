@@ -361,7 +361,7 @@ func main() {
 	)
 	pumpSwapWatcher := watcher.NewProgramWatcherWithCallback(
 		solanaWSEndpoints[0],
-		watcher.ProgramPumpSwap,
+		watcher.ProgramPumpFunAMM, // pAMMBay6... — the actual DEX AMM that emits BuyEvent/SellEvent
 		db, solanaPairs,
 		func(poolAddress string, pair shared.Pair) (float64, error) {
 			return solanaFetch(poolAddress, pair)
@@ -383,7 +383,7 @@ func main() {
 	go orcaWatcher.Start()
 	go raydiumCPMMWatcher.Start()
 	go pumpSwapWatcher.Start()
-	log.Println("Started program-level watchers: Raydium CLMM/CPMM + Orca + Pump.fun bonding curve")
+	log.Println("Started program-level watchers: Raydium CLMM/CPMM + Orca + Pump.fun AMM")
 
 	// ── Detect Raydium pool types (CPMM vs AMM V4) ───────────────────────────
 	// After the server migration, dex_name for CPMM = "Raydium CPMM" and

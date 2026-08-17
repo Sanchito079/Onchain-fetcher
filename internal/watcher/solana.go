@@ -538,7 +538,15 @@ func ResolveTokenOrder(pairs []PairMeta, rpcEndpoint string) []PairMeta {
 			pairs[i].Token0OrderKnown = true
 			log.Printf("[watcher] %s/%s — token0=quote (mint0=%s...)", p.BaseSymbol, p.QuoteSymbol, mint0[:min8(mint0)])
 		} else {
-			log.Printf("[watcher] %s/%s — mints don't match DB tokens (mint0=%s, base=%s)",
+			// Mints don't match DB tokens — this usually means GeckoTerminal stored the pair
+			// with inverted base/quote. The server's on-chain verification should fix the DB
+			// on the next sync. For now, treat mint0 as base (on-chain canonical order) so
+			// the event price is at least consistent rather than randomly oscillating.
+			// The HTTP adapter re-reads mints from chain and will return the correct price
+			// for any swap where the event price is wrong.
+			pairs[i].Token0IsBase = true
+			pairs[i].Token0OrderKnown = true
+			log.Printf("[watcher] %s/%s — mints don't match DB tokens (mint0=%s, base=%s) — treating mint0 as base",
 				p.BaseSymbol, p.QuoteSymbol, mint0[:min8(mint0)], baseToken[:min8(baseToken)])
 		}
 	}
