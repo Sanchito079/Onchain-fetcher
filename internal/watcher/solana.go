@@ -380,8 +380,9 @@ func LoadSolanaPairs(db *sql.DB) ([]PairMeta, error) {
 		    OR dex_name ILIKE '%orca%'
 		    OR dex_name ILIKE '%meteora%'
 		    OR dex_name ILIKE '%dlmm%'
+		    OR dex_name ILIKE '%damm%'
 		    OR dex_name ILIKE '%pumpswap%'
-		    OR dex_name ILIKE '%pump-fun%'
+		    OR dex_name ILIKE '%pump%'
 		  )
 		ORDER BY id
 	`)

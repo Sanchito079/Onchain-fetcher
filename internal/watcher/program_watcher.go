@@ -781,11 +781,14 @@ func priceFromPumpFunAMMEvent(data []byte, baseDecimals, quoteDecimals int) floa
 // line that belongs to the swap for the given pool. It finds the data line
 // that immediately precedes or follows the swap instruction for this pool.
 func (w *ProgramWatcher) extractEventDataForPool(logs []string, poolAddress string) []byte {
-	// Find the "Program data:" line associated with the pool swap.
-	// Strategy: find all data lines and return the one whose decoded bytes
-	// contain our pool address at offset 8 (canonical Anchor event layout).
-	//
-	// ALL Anchor programs (Raydium, Orca, Meteora) emit events as base64 in "Program data:" lines.
+	// Determine which byte offset the pool pubkey appears at in this program's events.
+	// Most programs (Raydium, Orca, CPMM) use offset 8 (standard Anchor layout).
+	// Pump.fun AMM events have 14 u64 fields before the pool pubkey → offset 120.
+	poolPubkeyOffset := 8
+	if w.programID == ProgramPumpFunAMM {
+		poolPubkeyOffset = 120
+	}
+
 	dataLines := 0
 	for _, line := range logs {
 		if !strings.Contains(line, "Program data: ") {
@@ -794,20 +797,20 @@ func (w *ProgramWatcher) extractEventDataForPool(logs []string, poolAddress stri
 		dataLines++
 		b64 := strings.TrimSpace(strings.SplitN(line, "Program data:", 2)[1])
 		data, ok := decodeBase64EventData(b64)
-		if !ok || len(data) < 40 {
+		if !ok || len(data) < poolPubkeyOffset+32 {
 			continue
 		}
-		// Check if this event's pool address (at offset 8) matches.
-		candidate := encodeBase58(data[8:40])
-		log.Printf("[prog/%s] Checking data line %d: candidate=%s, looking_for=%s", 
+		// Check if this event's pool address matches at the program-specific offset.
+		candidate := encodeBase58(data[poolPubkeyOffset : poolPubkeyOffset+32])
+		log.Printf("[prog/%s] Checking data line %d: candidate=%s, looking_for=%s",
 			shortID(w.programID), dataLines, candidate[:8]+"...", poolAddress[:8]+"...")
 		if strings.EqualFold(candidate, poolAddress) {
-			log.Printf("[prog/%s] MATCH! found event data for %s (scanned %d lines)", 
+			log.Printf("[prog/%s] MATCH! found event data for %s (scanned %d lines)",
 				shortID(w.programID), poolAddress, dataLines)
 			return data
 		}
 	}
-	log.Printf("[prog/%s] NO MATCH for %s (scanned %d lines, program=%s)", 
+	log.Printf("[prog/%s] NO MATCH for %s (scanned %d lines, program=%s)",
 		shortID(w.programID), poolAddress, dataLines, w.programID)
 	return nil
 }
@@ -892,12 +895,31 @@ func (w *ProgramWatcher) decodePoolFromProgramData(b64str string) string {
 		// CPMM SwapEvent: pool_id is also at bytes [8:40]
 		return decodeRaydiumPoolFromEventData(data)
 	case ProgramPumpFunAMM:
-		// Pump.fun AMM: pool pubkey at bytes [8:40]
-		return decodeRaydiumPoolFromEventData(data)
+		// Pump.fun AMM BuyEvent/SellEvent: pool pubkey is at offset 120
+		// Layout (after 8-byte discriminator):
+		//   8×1 i64 + 14×8 u64 fields = 8 + 112 = 120 bytes before pool pubkey
+		if len(data) < 152 { // 120 + 32
+			return ""
+		}
+		return w.decodePoolFromProgramDataAtOffset(data, 120)
 	default:
 		// Meteora programs don't emit events, so this should never be called for them
 		return decodeRaydiumPoolFromEventData(data)
 	}
+}
+
+// decodePoolFromProgramDataAtOffset reads a 32-byte pubkey at a given offset
+// and checks if it matches a tracked pool. Used for programs where the pool
+// pubkey is not at the standard [8:40] position.
+func (w *ProgramWatcher) decodePoolFromProgramDataAtOffset(data []byte, offset int) string {
+	if len(data) < offset+32 {
+		return ""
+	}
+	addr := encodeBase58(data[offset : offset+32])
+	if w.poolExists(addr) {
+		return addr
+	}
+	return ""
 }
 
 func decodeBase64EventData(b64str string) ([]byte, bool) {

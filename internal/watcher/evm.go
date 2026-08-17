@@ -657,6 +657,7 @@ func LoadEVMPairs(db *sql.DB, network string) ([]EVMPairMeta, error) {
 		    OR dex_name ILIKE '%uniswap%'
 		    OR dex_name ILIKE '%slipstream%'
 		    OR dex_name ILIKE '%aerodrome%'
+		    OR dex_name ILIKE '%infinity%'
 		  )
 		ORDER BY id
 	`, network)

@@ -224,7 +224,8 @@ func main() {
 			result, fetchErr = orca.Adapter{RPC: orca.RPCClient{Endpoint: endpoint}}.FetchPrice(pair)
 		case strings.Contains(dex, "meteora") || strings.Contains(dex, "dlmm") || strings.Contains(dex, "damm"):
 			result, fetchErr = meteora.Adapter{RPC: &meteora.RPCClient{Endpoint: endpoint}}.FetchPrice(pair)
-		case strings.Contains(dex, "pumpswap") || strings.Contains(dex, "pump"):
+		case strings.Contains(dex, "pump"):
+			// Covers: "PumpSwap", "Pump.fun AMM", "Pump.fun", "pumpswap", "pump-fun"
 			result, fetchErr = pumpswap.Adapter{RPC: pumpswap.RPCClient{Endpoint: endpoint}}.FetchPrice(pair)
 		default:
 			fetchErr = fmt.Errorf("unsupported dex: %s", pair.DexName)
@@ -261,6 +262,7 @@ func main() {
 		case strings.Contains(dex, "slipstream") || strings.Contains(dex, "aerodrome"):
 			result, fetchErr = slipstream.Adapter{RPC: slipstream.RPCClient{Endpoint: endpoint}}.FetchPrice(pair)
 		default:
+			// Covers: "PancakeSwap V2", "PancakeSwap V3", "PancakeSwap Infinity", "pancakeswap"
 			result, fetchErr = pancakeswap.Adapter{RPC: pancakeswap.RPCClient{Endpoint: endpoint}}.FetchPrice(pair)
 		}
 		if fetchErr != nil { return 0, fetchErr }
