@@ -1,11 +1,13 @@
 package watcher
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math/big"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +30,11 @@ type EVMPairMeta struct {
 	QuoteTokenDecimals int
 	BaseSymbol         string
 	QuoteSymbol        string
+	// Token0IsBase is true when the pool's on-chain token0 == DB base_token.
+	// Populated by resolveEVMTokenOrder at startup via token0()/token1() calls.
+	// When true, sqrtPriceX96 directly gives quote/base; when false, invert.
+	Token0IsBase     bool
+	Token0OrderKnown bool
 }
 
 // EVMWatcher subscribes to Swap events on EVM chains (Base, BSC) via
@@ -555,38 +562,54 @@ func (w *EVMWatcher) subscribeNewPairs(
 
 // extractV3Price parses the sqrtPriceX96 from a V3 Swap event data field
 // and converts it to a human-readable quote/base price.
-// It calculates both direct and inverted prices, then selects the sane one.
+//
+// When Token0OrderKnown is set (resolved at startup via token0()/token1()), we
+// use exactly one calculation path — no guessing. This is the authoritative path
+// and is always correct when the DB metadata is good.
+//
+// When Token0OrderKnown is false we fall back to two candidates (direct and
+// inverted with the correct decimals), and let ChooseSanePrice pick the first
+// value that falls in a sane range. We do NOT try swapped decimals anymore
+// because that produces 4 candidates where 2 can both be "sane" for pairs like
+// ETH/USDT, causing the wrong one to be selected deterministically.
 func (w *EVMWatcher) extractV3Price(data string, pair EVMPairMeta) float64 {
 	// data is hex-encoded: 0x + 5 × 32 bytes = 320 hex chars after 0x
-	hex := strings.TrimPrefix(data, "0x")
-	if len(hex) < 320 {
+	hexStr := strings.TrimPrefix(data, "0x")
+	if len(hexStr) < 320 {
 		return 0
 	}
 	// sqrtPriceX96 is at offset 64 (bytes 64–95, i.e. hex chars 128–191)
-	sqrtHex := hex[128:192]
+	sqrtHex := hexStr[128:192]
 	sqrtPrice := new(big.Int)
 	sqrtPrice.SetString(sqrtHex, 16)
 	if sqrtPrice.Sign() == 0 {
 		return 0
 	}
 
-	// Get decimals for token0 and token1
-	// We need to determine token ordering - which token is token0?
-	decimal0 := pair.BaseTokenDecimals
-	decimal1 := pair.QuoteTokenDecimals
-	
-	// Calculate both orientations
-	directPrice := w.calculateV3PriceOriented(sqrtPrice, decimal0, decimal1, true)
-	invertedPrice := w.calculateV3PriceOriented(sqrtPrice, decimal0, decimal1, false)
-	
-	// Also calculate with swapped decimals to handle all possible token orderings
-	swappedDirect := w.calculateV3PriceOriented(sqrtPrice, decimal1, decimal0, true)
-	swappedInverted := w.calculateV3PriceOriented(sqrtPrice, decimal1, decimal0, false)
-	
-	// Use the same logic as HTTP adapters: choose the most reasonable price
-	price := shared.ChooseSanePrice(directPrice, invertedPrice, swappedDirect, swappedInverted)
-	
-	return price
+	if pair.Token0OrderKnown {
+		// Authoritative path: we know which token is token0.
+		// Use the decimals exactly as they correspond to on-chain token0/token1.
+		var decimal0, decimal1 int
+		if pair.Token0IsBase {
+			decimal0 = pair.BaseTokenDecimals
+			decimal1 = pair.QuoteTokenDecimals
+		} else {
+			decimal0 = pair.QuoteTokenDecimals
+			decimal1 = pair.BaseTokenDecimals
+		}
+		price := w.calculateV3PriceOriented(sqrtPrice, decimal0, decimal1, pair.Token0IsBase)
+		if price > 0 {
+			return price
+		}
+		// Arithmetic result was 0 or ±Inf — fall through to fallback below
+	}
+
+	// Fallback: token order unknown (e.g. new pool added before startup probe).
+	// Try direct (base=token0) and inverted (base=token1) with the DB decimals.
+	// Pick the first value in the sane range [1e-18, 1e12].
+	directPrice := w.calculateV3PriceOriented(sqrtPrice, pair.BaseTokenDecimals, pair.QuoteTokenDecimals, true)
+	invertedPrice := w.calculateV3PriceOriented(sqrtPrice, pair.BaseTokenDecimals, pair.QuoteTokenDecimals, false)
+	return shared.ChooseSanePrice(directPrice, invertedPrice)
 }
 
 // calculateV3PriceOriented calculates V3 price with specific token ordering
@@ -676,8 +699,27 @@ func LoadEVMPairs(db *sql.DB, network string) ([]EVMPairMeta, error) {
 			&p.BaseSymbol, &p.QuoteSymbol); err != nil {
 			return nil, err
 		}
-		p.BaseToken = parseEVMAddress(baseTokenJSON.String)
-		p.QuoteToken = parseEVMAddress(quoteTokenJSON.String)
+		// Extract address AND decimals from JSON metadata.
+		// The on-chain decimals stored in the JSON are authoritative; the plain
+		// DB column value is used only when the JSON has none.
+		baseAddr, baseDec := parseTokenJSON(baseTokenJSON.String)
+		quoteAddr, quoteDec := parseTokenJSON(quoteTokenJSON.String)
+		if baseAddr != "" {
+			p.BaseToken = baseAddr
+		} else {
+			p.BaseToken = parseEVMAddress(baseTokenJSON.String)
+		}
+		if quoteAddr != "" {
+			p.QuoteToken = quoteAddr
+		} else {
+			p.QuoteToken = parseEVMAddress(quoteTokenJSON.String)
+		}
+		if baseDec > 0 {
+			p.BaseTokenDecimals = baseDec
+		}
+		if quoteDec > 0 {
+			p.QuoteTokenDecimals = quoteDec
+		}
 		if p.PoolAddress == "" {
 			continue
 		}
@@ -697,4 +739,125 @@ func parseEVMAddress(raw string) string {
 		return ""
 	}
 	return strings.TrimSpace(payload.Address)
+}
+
+// MarkAllToken0IsBase marks every pair as token0=base without making any RPC
+// calls. Use this when the DB was populated by the on-chain indexer, which
+// always stores base_token = token0 (canonical on-chain order).
+func MarkAllToken0IsBase(pairs []EVMPairMeta) []EVMPairMeta {
+	for i := range pairs {
+		pairs[i].Token0IsBase = true
+		pairs[i].Token0OrderKnown = true
+	}
+	return pairs
+}
+// and sets Token0IsBase / Token0OrderKnown on each EVMPairMeta.
+//
+// This mirrors the server's applyEVMOnChainData() logic so the watcher always
+// uses the authoritative on-chain ordering when computing prices from swap events.
+// Only V2/V3 standard pools support token0()/token1(). CLMM / V4 pools that use
+// a PoolManager address (66-char pool ID) are skipped — they don't expose those
+// getter functions.
+func ResolveEVMTokenOrder(pairs []EVMPairMeta, rpcEndpoint string) []EVMPairMeta {
+	// ABI-encoded selector bytes
+	// token0() → keccak256("token0()")[0:4] = 0x0dfe1681
+	// token1() → keccak256("token1()")[0:4] = 0xd21220a7
+	const token0Selector = "0x0dfe1681"
+	const token1Selector = "0xd21220a7"
+
+	callEVM := func(poolAddr, selector string) (string, error) {
+		body, _ := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      1,
+			"method":  "eth_call",
+			"params":  []any{map[string]string{"to": poolAddr, "data": selector}, "latest"},
+		})
+		req, err := http.NewRequest("POST", rpcEndpoint, bytes.NewReader(body))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		client := &http.Client{Timeout: 8 * time.Second}
+		httpResp, err := client.Do(req)
+		if err != nil {
+			return "", err
+		}
+		defer httpResp.Body.Close()
+		var result struct {
+			Result string `json:"result"`
+			Error  any    `json:"error"`
+		}
+		if err := json.NewDecoder(httpResp.Body).Decode(&result); err != nil {
+			return "", err
+		}
+		if result.Error != nil {
+			return "", fmt.Errorf("eth_call error: %v", result.Error)
+		}
+		return result.Result, nil
+	}
+
+	decodeAddr := func(hex string) string {
+		hex = strings.TrimPrefix(hex, "0x")
+		if len(hex) < 40 {
+			return ""
+		}
+		return "0x" + strings.ToLower(hex[len(hex)-40:])
+	}
+
+	for i, p := range pairs {
+		addr := strings.ToLower(strings.TrimSpace(p.PoolAddress))
+		// Skip CLMM/V4 pools — they use Pool Manager, not individual token0()/token1()
+		if len(addr) == 66 {
+			log.Printf("[evm-token-order] %s/%s — CLMM/V4 pool, skipping token order probe", p.BaseSymbol, p.QuoteSymbol)
+			continue
+		}
+		if len(addr) != 42 {
+			log.Printf("[evm-token-order] %s/%s — unexpected address length %d, skipping", p.BaseSymbol, p.QuoteSymbol, len(addr))
+			continue
+		}
+
+		t0raw, err := callEVM(addr, token0Selector)
+		if err != nil {
+			log.Printf("[evm-token-order] token0() failed for %s (%s/%s): %v", addr[:10], p.BaseSymbol, p.QuoteSymbol, err)
+			continue
+		}
+		t1raw, err := callEVM(addr, token1Selector)
+		if err != nil {
+			log.Printf("[evm-token-order] token1() failed for %s (%s/%s): %v", addr[:10], p.BaseSymbol, p.QuoteSymbol, err)
+			continue
+		}
+
+		token0 := decodeAddr(t0raw)
+		token1 := decodeAddr(t1raw)
+		if token0 == "" || token1 == "" {
+			log.Printf("[evm-token-order] empty token0/token1 for %s (%s/%s)", addr[:10], p.BaseSymbol, p.QuoteSymbol)
+			continue
+		}
+
+		dbBase := strings.ToLower(strings.TrimSpace(p.BaseToken))
+		if token0 == dbBase {
+			pairs[i].Token0IsBase = true
+			pairs[i].Token0OrderKnown = true
+			log.Printf("[evm-token-order] %s/%s → token0=base (%s...)", p.BaseSymbol, p.QuoteSymbol, token0[:10])
+		} else if token1 == dbBase {
+			pairs[i].Token0IsBase = false
+			pairs[i].Token0OrderKnown = true
+			log.Printf("[evm-token-order] %s/%s → token0=quote (%s...)", p.BaseSymbol, p.QuoteSymbol, token0[:10])
+		} else {
+			// Neither matches — likely DB address is stale or wrong. Default to
+			// token0=base (on-chain canonical) so at least we're deterministic.
+			pairs[i].Token0IsBase = true
+			pairs[i].Token0OrderKnown = true
+			log.Printf("[evm-token-order] %s/%s — DB base %s doesn't match token0=%s or token1=%s — defaulting token0=base",
+				p.BaseSymbol, p.QuoteSymbol, dbBase[:min10(dbBase)], token0[:10], token1[:10])
+		}
+	}
+	return pairs
+}
+
+func min10(s string) int {
+	if len(s) < 10 {
+		return len(s)
+	}
+	return 10
 }

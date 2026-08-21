@@ -383,6 +383,7 @@ func LoadSolanaPairs(db *sql.DB) ([]PairMeta, error) {
 		    OR dex_name ILIKE '%damm%'
 		    OR dex_name ILIKE '%pumpswap%'
 		    OR dex_name ILIKE '%pump%'
+		    OR dex_name ILIKE '%cpmm%'
 		  )
 		ORDER BY id
 	`)
@@ -401,8 +402,28 @@ func LoadSolanaPairs(db *sql.DB) ([]PairMeta, error) {
 			&p.BaseSymbol, &p.QuoteSymbol); err != nil {
 			return nil, err
 		}
-		p.BaseToken = parseAddress(baseTokenJSON.String)
-		p.QuoteToken = parseAddress(quoteTokenJSON.String)
+		// Extract address AND decimals from the JSON metadata.
+		// Prefer the JSON decimals (written from on-chain SPL mint account by the
+		// server) over the plain DB column which defaults to 18 — a correct EVM
+		// default but wrong for Solana SPL tokens (typically 6 or 9).
+		baseAddr, baseDec := parseTokenJSON(baseTokenJSON.String)
+		quoteAddr, quoteDec := parseTokenJSON(quoteTokenJSON.String)
+		if baseAddr != "" {
+			p.BaseToken = baseAddr
+		} else {
+			p.BaseToken = parseAddress(baseTokenJSON.String)
+		}
+		if quoteAddr != "" {
+			p.QuoteToken = quoteAddr
+		} else {
+			p.QuoteToken = parseAddress(quoteTokenJSON.String)
+		}
+		if baseDec > 0 {
+			p.BaseTokenDecimals = baseDec
+		}
+		if quoteDec > 0 {
+			p.QuoteTokenDecimals = quoteDec
+		}
 		if p.PoolAddress == "" {
 			continue
 		}
@@ -462,6 +483,23 @@ func parseAddress(raw string) string {
 		return ""
 	}
 	return strings.TrimSpace(payload.Address)
+}
+
+// parseTokenJSON parses a token metadata JSON string (as stored in the DB)
+// and returns the token address and decimals. Returns empty string and 0
+// if the input is empty or malformed.
+func parseTokenJSON(raw string) (address string, decimals int) {
+	if strings.TrimSpace(raw) == "" {
+		return "", 0
+	}
+	var payload struct {
+		Address  string `json:"address"`
+		Decimals int    `json:"decimals"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return "", 0
+	}
+	return strings.TrimSpace(payload.Address), payload.Decimals
 }
 
 // ResolveTokenOrder fetches each pool account once from the RPC and populates
@@ -665,4 +703,17 @@ func getRPCAccountData(endpoint, address string) ([]byte, error) {
 		}
 	}
 	return decoded, nil
+}
+
+// MarkAllSolanaToken0IsBase marks every Solana pair as token0=base without
+// making any RPC calls. Use this when the DB was populated by the on-chain
+// indexer, which always stores base_token = token_mint_0 (canonical on-chain
+// order). This replaces the old ResolveAndCache startup probe which made one
+// getAccountInfo call per pool and was extremely slow with thousands of pairs.
+func MarkAllSolanaToken0IsBase(pairs []PairMeta) []PairMeta {
+	for i := range pairs {
+		pairs[i].Token0IsBase = true
+		pairs[i].Token0OrderKnown = true
+	}
+	return pairs
 }

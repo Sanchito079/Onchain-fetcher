@@ -106,6 +106,8 @@ func buildSyncQueryAndArgs() (string, []any) {
 		    OR dex_name ILIKE '%%meteora%%'
 		    OR dex_name ILIKE '%%dlmm%%'
 		    OR dex_name ILIKE '%%raydium%%'
+		    OR dex_name ILIKE '%%orca%%'
+		    OR dex_name ILIKE '%%cpmm%%'
 		  )
 		ORDER BY id
 		`, strings.Join(networkClauses, ", ")), nil
@@ -183,12 +185,19 @@ func (s *Syncer) SyncOnce() error {
 		if quoteAddress != "" {
 			row.QuoteToken = quoteAddress
 		}
-		if row.BaseTokenDecimals == 0 {
+		// Prefer on-chain decimals from the JSON metadata when available.
+		// The DB column defaults to 18, which is correct for EVM tokens but
+		// wrong for Solana SPL tokens (typically 6 or 9). If the metadata
+		// has a non-zero decimal value, always use it — it was read from the
+		// on-chain SPL mint account and is the authoritative source.
+		if baseDecimals > 0 {
 			row.BaseTokenDecimals = baseDecimals
 		}
-		if row.QuoteTokenDecimals == 0 {
+		if quoteDecimals > 0 {
 			row.QuoteTokenDecimals = quoteDecimals
 		}
+		// Final guard: if still 0 after both sources, keep the DB column value
+		// (may be 0 for missing data — adapters will handle it gracefully).
 
 		pair := shared.Pair{
 			ID:                 row.ID,

@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"on-chain-price-fetcher/internal/adapters/meteora"
 	"on-chain-price-fetcher/internal/adapters/orca"
@@ -91,6 +92,14 @@ func toWSS(endpoint string) string {
 }
 
 func main() {
+	// Load .env from working directory if present.
+	// Real environment variables always take precedence over .env values.
+	if err := godotenv.Load(); err != nil {
+		log.Println("[config] no .env file found, using environment variables")
+	} else {
+		log.Println("[config] loaded .env")
+	}
+
 	dsn := getEnv("DATABASE_URL", "postgres://postgres:postgres@127.0.0.1:55422/postgres?sslmode=disable")
 
 	// Initialize JSONL price hit logger
@@ -275,29 +284,24 @@ func main() {
 	if err != nil { log.Fatalf("Failed to load Solana pairs: %v", err) }
 	log.Printf("Loaded %d Solana pools", len(solanaPairs))
 
-	// Resolve token order with cache — only RPC-probe pools not already cached.
-	// Cache file persists across restarts so subsequent startups are instant.
-	tokenOrderCache := watcher.NewTokenOrderCache("token_order_cache.json")
-	cachedPairs, uncachedPairs := tokenOrderCache.ApplyToSolanaPairs(solanaPairs)
-	log.Printf("[token-order-cache] %d pairs from cache, %d need RPC probe",
-		len(cachedPairs), len(uncachedPairs))
-
-	if len(uncachedPairs) > 0 {
-		log.Printf("Resolving token order for %d new Solana pairs via RPC...", len(uncachedPairs))
-		resolvedNew := watcher.ResolveAndCache(uncachedPairs, solanaRPC, tokenOrderCache)
-		solanaPairs = append(cachedPairs, resolvedNew...)
-	} else {
-		solanaPairs = cachedPairs
-		log.Printf("All Solana pairs loaded from token order cache — skipping RPC probes")
-	}
+	// On-chain indexer writes base_token = token_mint_0 (canonical on-chain order)
+	// for all Solana programs — same guarantee as EVM. Skip RPC probes entirely.
+	// Mark all pairs as token0=base so event-based price extraction uses the
+	// correct orientation without any startup delay.
+	solanaPairs = watcher.MarkAllSolanaToken0IsBase(solanaPairs)
+	log.Printf("Marked %d Solana pairs as token0=base (skipping RPC probes)", len(solanaPairs))
 
 	basePairs, err := watcher.LoadEVMPairs(db, "base")
 	if err != nil { log.Fatalf("Failed to load Base pairs: %v", err) }
 	log.Printf("Loaded %d Base pools", len(basePairs))
+	// On-chain indexer writes base_token = token0 (canonical chain order).
+	// No RPC probe needed — mark all as token0=base directly.
+	basePairs = watcher.MarkAllToken0IsBase(basePairs)
 
 	bscPairs, err := watcher.LoadEVMPairs(db, "bsc")
 	if err != nil { log.Fatalf("Failed to load BSC pairs: %v", err) }
 	log.Printf("Loaded %d BSC pools", len(bscPairs))
+	bscPairs = watcher.MarkAllToken0IsBase(bscPairs)
 
 	// ── Step 6: Start WebSocket watchers ──────────────────────────────────────
 
@@ -532,14 +536,14 @@ func main() {
 				watchers[i%len(watchers)].AddPairs([]watcher.EVMPairMeta{p})
 			}
 		},
-		// onNewSolanaPairs: resolve token order first, cache it, then inject into watchers
+		// onNewSolanaPairs: new pools from the indexer always have base=token0.
+		// Mark them directly and inject into watchers — no RPC probe needed.
 		func(newPairs []watcher.PairMeta) {
 			if len(fallbackSolanaWatchers) == 0 {
 				return
 			}
-			// Resolve token order for new pools and add to cache
-			resolvedPairs := watcher.ResolveAndCache(newPairs, solanaRPC, tokenOrderCache)
-			for i, p := range resolvedPairs {
+			marked := watcher.MarkAllSolanaToken0IsBase(newPairs)
+			for i, p := range marked {
 				fallbackSolanaWatchers[i%len(fallbackSolanaWatchers)].AddPairs([]watcher.PairMeta{p})
 			}
 		},

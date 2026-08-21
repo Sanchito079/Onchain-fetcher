@@ -71,6 +71,12 @@ type ProgramWatcher struct {
 	lastUpdateMu sync.Mutex
 	lastUpdate   map[string]time.Time
 	debounce     time.Duration
+
+	// lastPriceMu guards lastPrice — used for spike detection.
+	// If an incoming event price is more than 50x away from the last written
+	// price, we assume it's a garbage read and fall back to HTTP.
+	lastPriceMu sync.Mutex
+	lastPrice   map[string]float64
 }
 
 // NewProgramWatcher creates a watcher for a single program.
@@ -113,6 +119,7 @@ func NewProgramWatcherWithCallback(
 		stopCh:        make(chan struct{}),
 		lastUpdate:    make(map[string]time.Time),
 		debounce:      500 * time.Millisecond,
+		lastPrice:     loadLastPriceFromDB(db, programID),
 	}
 }
 
@@ -123,6 +130,39 @@ func (w *ProgramWatcher) AddPair(p PairMeta) {
 	w.poolMap[trim] = p
 	w.poolMap[strings.ToLower(trim)] = p
 	w.mu.Unlock()
+}
+
+// loadLastPriceFromDB reads the last known price for every pool owned by the
+// given program from the DB. This pre-populates the spike-guard baseline so
+// the very first swap event on an existing pool is compared against a real
+// price rather than triggering the "no baseline → use HTTP" path unnecessarily.
+func loadLastPriceFromDB(db *sql.DB, programID string) map[string]float64 {
+	prices := make(map[string]float64)
+	if db == nil {
+		return prices
+	}
+	rows, err := db.Query(`
+		SELECT pool_address, gecko_price
+		FROM pairs
+		WHERE program_id = $1
+		  AND gecko_price IS NOT NULL
+		  AND gecko_price > 0
+	`, programID)
+	if err != nil {
+		return prices
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var pool string
+		var price float64
+		if err := rows.Scan(&pool, &price); err != nil {
+			continue
+		}
+		pool = strings.TrimSpace(pool)
+		prices[pool] = price
+		prices[strings.ToLower(pool)] = price
+	}
+	return prices
 }
 
 // Start connects and listens, reconnecting on disconnect.
@@ -363,6 +403,54 @@ func (w *ProgramWatcher) fetchAndUpdate(pair PairMeta, eventData []byte) {
 		return
 	}
 
+	// Spike guard: if the event-derived price is more than 50x away from
+	// the last known price for this pool, treat it as a garbage read.
+	// This catches CPMM events where the wrong blob offset is decoded,
+	// producing billions instead of ~0.007, without blocking genuine
+	// large price moves (50x is ~4900% which no real swap achieves in one tx).
+	//
+	// For the very FIRST price of a pool (no lastPrice entry yet), always
+	// validate via HTTP — we have no baseline to compare against and the
+	// first swap on a new/unbalanced pool can have extreme vault ratios.
+	w.lastPriceMu.Lock()
+	last, hasLast := w.lastPrice[pair.PoolAddress]
+
+	if source == "event" && (!hasLast || last <= 0) {
+		// No baseline — fall back to HTTP for the first price of this pool.
+		w.lastPriceMu.Unlock()
+		log.Printf("[prog/%s] no baseline for %s/%s (first price) — validating via HTTP",
+			shortID(w.programID), pair.BaseSymbol, pair.QuoteSymbol)
+		var fetchErr error
+		price, fetchErr = w.fetchFn(pair.PoolAddress, sharedPair)
+		source = "http"
+		if fetchErr != nil || price <= 0 {
+			log.Printf("[prog/%s] HTTP validation failed for %s: err=%v price=%.10g",
+				shortID(w.programID), pair.PoolAddress, fetchErr, price)
+			return
+		}
+		log.Printf("[prog/%s] ✓ %s/%s → %.10g (http first-price)", shortID(w.programID), pair.BaseSymbol, pair.QuoteSymbol, price)
+		w.lastPriceMu.Lock()
+	} else if hasLast && last > 0 && source == "event" {
+		ratio := price / last
+		if ratio > 50 || ratio < 0.02 {
+			log.Printf("[prog/%s] spike rejected for %s/%s: %.6g vs last=%.6g (ratio=%.4f) — falling back to HTTP",
+				shortID(w.programID), pair.BaseSymbol, pair.QuoteSymbol, price, last, ratio)
+			w.lastPriceMu.Unlock()
+			var fetchErr error
+			price, fetchErr = w.fetchFn(pair.PoolAddress, sharedPair)
+			source = "http"
+			if fetchErr != nil || price <= 0 {
+				log.Printf("[prog/%s] HTTP fallback also failed for %s: err=%v price=%.10g",
+					shortID(w.programID), pair.PoolAddress, fetchErr, price)
+				return
+			}
+			log.Printf("[prog/%s] ✓ %s/%s → %.10g (http after spike)", shortID(w.programID), pair.BaseSymbol, pair.QuoteSymbol, price)
+			w.lastPriceMu.Lock()
+		}
+	}
+	w.lastPrice[pair.PoolAddress] = price
+	w.lastPriceMu.Unlock()
+
 	if err := stats.UpdatePriceWithStats(w.db, pair.ID, price, price); err != nil {
 		log.Printf("[prog/%s] DB update failed for %s: %v", shortID(w.programID), pair.ID, err)
 		return
@@ -483,6 +571,15 @@ func priceFromOrcaEvent(data []byte, baseDecimals, quoteDecimals int, baseToken,
 // blob and converts it to a human-readable price. Zero HTTP calls.
 func priceFromRaydiumEvent(data []byte, baseDecimals, quoteDecimals int, baseToken, quoteToken string, token0IsBase, token0OrderKnown bool) float64 {
 	if len(data) < 185 {
+		log.Printf("[CLMM] data too short: %d bytes", len(data))
+		return 0
+	}
+
+	var disc [8]byte
+	copy(disc[:], data[0:8])
+	raydiumSwapDisc := [8]byte{64, 198, 205, 232, 38, 8, 113, 226}
+	if disc != raydiumSwapDisc {
+		log.Printf("[CLMM] discriminator mismatch: got %v, want %v", disc, raydiumSwapDisc)
 		return 0
 	}
 
@@ -505,7 +602,6 @@ func priceFromRaydiumEvent(data []byte, baseDecimals, quoteDecimals int, baseTok
 	if token0OrderKnown {
 		oriented := new(big.Rat).Set(priceRat) // token1/token0
 		if !token0IsBase {
-			// token0 == quote, token1 == base → invert to get quote/base
 			oriented.Inv(oriented)
 		}
 		adjusted := shared.ApplyDecimalAdjustments(oriented, baseDecimals, quoteDecimals)
@@ -514,6 +610,7 @@ func priceFromRaydiumEvent(data []byte, baseDecimals, quoteDecimals int, baseTok
 		}
 		f, _ := adjusted.Float64()
 		if f <= 0 || math.IsNaN(f) || math.IsInf(f, 0) {
+			log.Printf("[CLMM] invalid price f=%v token0IsBase=%v baseDecimals=%d quoteDecimals=%d", f, token0IsBase, baseDecimals, quoteDecimals)
 			return 0
 		}
 		return f
@@ -551,12 +648,36 @@ func priceFromRaydiumEvent(data []byte, baseDecimals, quoteDecimals int, baseTok
 //   [88]     base_input: bool (1 byte)
 //   [89:121] input_mint: pubkey (32 bytes)
 //   [121:153] output_mint: pubkey (32 bytes)
+//   [153:161] trade_fee: u64
+//   [161:169] creator_fee: u64
+//   [169]     creator_fee_on_input: bool
 //
 // Price = output_vault_before / input_vault_before adjusted for decimals.
 // We orient by matching input_mint/output_mint against DB base/quote tokens.
 func priceFromCPMMEvent(data []byte, baseDecimals, quoteDecimals int, baseToken, quoteToken string) float64 {
-	// Need at least 153 bytes to read output_mint
-	if len(data) < 153 {
+	// Need at least 170 bytes to read all SwapEvent fields including creator_fee_on_input
+	if len(data) < 170 {
+		return 0
+	}
+
+	// Verify this is actually a SwapEvent by checking the discriminator.
+	// Raydium CPMM SwapEvent discriminator: [64, 198, 205, 232, 38, 8, 113, 226]
+	// If the discriminator doesn't match, this is a different CPMM event
+	// (e.g., other pool events) that may have data at the same offsets but
+	// those bytes are NOT vault balances → would produce garbage prices.
+	var disc [8]byte
+	copy(disc[:], data[0:8])
+	cpmmSwapDisc := [8]byte{64, 198, 205, 232, 38, 8, 113, 226}
+	if disc != cpmmSwapDisc {
+		return 0
+	}
+
+	// Validate that input_mint and output_mint look like real Solana addresses.
+	// This catches cases where the event data blob is from a different event
+	// type that happens to share the same discriminator but has a different layout.
+	inputMint := encodeBase58(data[89:121])
+	outputMint := encodeBase58(data[121:153])
+	if !looksLikeSolanaAddr(inputMint) || !looksLikeSolanaAddr(outputMint) {
 		return 0
 	}
 
@@ -566,8 +687,15 @@ func priceFromCPMMEvent(data []byte, baseDecimals, quoteDecimals int, baseToken,
 		return 0
 	}
 
-	inputMint := encodeBase58(data[89:121])
-	_ = encodeBase58(data[121:153]) // outputMint — not needed since we determine orientation from inputMint alone
+	// Validate trade_fee is reasonable (not astronomically large, which would
+	// indicate we're reading the wrong offsets).
+	tradeFee := binary.LittleEndian.Uint64(data[153:161])
+	// trade_fee should be much smaller than the vault balances for a normal swap.
+	// If it's comparable to or larger than the vault balances, the data is likely
+	// from a different event or the offsets are wrong.
+	if tradeFee > 0 && (tradeFee >= inputVault || tradeFee >= outputVault) {
+		return 0
+	}
 
 	// Determine orientation: is inputMint == base or quote?
 	// price = quoteVault / baseVault (base per quote doesn't make sense, we want quote/base)
@@ -576,22 +704,32 @@ func priceFromCPMMEvent(data []byte, baseDecimals, quoteDecimals int, baseToken,
 
 	inputIsBase := strings.EqualFold(inputMint, baseToken)
 	inputIsQuote := strings.EqualFold(inputMint, quoteToken)
+	outputIsBase := strings.EqualFold(outputMint, baseToken)
+	outputIsQuote := strings.EqualFold(outputMint, quoteToken)
 
-	if inputIsBase {
+	// Validate that input and output mints are different and match our known tokens.
+	// If neither mint matches our DB tokens, the event data is likely from a
+	// different event or the DB token metadata is wrong — fall back to ratio.
+	if inputIsBase && outputIsQuote {
 		baseVault = inputVault
 		quoteVault = outputVault
 		baseDecAdj = baseDecimals
 		quoteDecAdj = quoteDecimals
-	} else if inputIsQuote {
+	} else if inputIsQuote && outputIsBase {
 		baseVault = outputVault
 		quoteVault = inputVault
 		baseDecAdj = baseDecimals
 		quoteDecAdj = quoteDecimals
+	} else if inputIsBase && outputIsBase {
+		// Both mints match base — degenerate, skip
+		return 0
+	} else if inputIsQuote && outputIsQuote {
+		// Both mints match quote — degenerate, skip
+		return 0
 	} else {
-		// Mint doesn't match either DB token — fall back to ratio and let ChooseSanePrice decide
-		direct := vaultRatioToPrice(inputVault, outputVault, baseDecimals, quoteDecimals)
-		inverse := vaultRatioToPrice(outputVault, inputVault, baseDecimals, quoteDecimals)
-		return shared.ChooseSanePrice(direct, inverse)
+		// Mint doesn't match either DB token — we can't determine correct orientation
+		// so skip this event to avoid garbage prices from wrong data layout.
+		return 0
 	}
 
 	price := vaultRatioToPrice(quoteVault, baseVault, quoteDecAdj, baseDecAdj)
@@ -721,6 +859,15 @@ func priceFromPumpSwapEvent(data []byte, baseDecimals, quoteDecimals int, baseTo
 		return 0
 	}
 
+	// Verify this is actually a TradeEvent by checking the discriminator.
+	// PumpSwap TradeEvent discriminator: [189, 219, 127, 211, 78, 230, 97, 238]
+	var disc [8]byte
+	copy(disc[:], data[0:8])
+	tradeEventDisc := [8]byte{189, 219, 127, 211, 78, 230, 97, 238}
+	if disc != tradeEventDisc {
+		return 0
+	}
+
 	reserve0 := binary.LittleEndian.Uint64(data[40:48])
 	reserve1 := binary.LittleEndian.Uint64(data[48:56])
 	if reserve0 == 0 || reserve1 == 0 {
@@ -759,6 +906,18 @@ func priceFromPumpFunAMMEvent(data []byte, baseDecimals, quoteDecimals int) floa
 		return 0
 	}
 
+	// Verify this is actually a BuyEvent or SellEvent by checking the discriminator.
+	// PumpFun AMM BuyEvent discriminator: [103, 244, 82, 31, 44, 245, 119, 119]
+	// PumpFun AMM SellEvent discriminator: [62, 47, 55, 10, 165, 3, 220, 42]
+	// Both events have the same layout at offsets 48-64, so we accept either.
+	var disc [8]byte
+	copy(disc[:], data[0:8])
+	buyEventDisc := [8]byte{103, 244, 82, 31, 44, 245, 119, 119}
+	sellEventDisc := [8]byte{62, 47, 55, 10, 165, 3, 220, 42}
+	if disc != buyEventDisc && disc != sellEventDisc {
+		return 0
+	}
+
 	// Pool reserves are at offsets 48 and 56 (verified against IDL)
 	poolBaseReserves  := binary.LittleEndian.Uint64(data[48:56])
 	poolQuoteReserves := binary.LittleEndian.Uint64(data[56:64])
@@ -780,6 +939,13 @@ func priceFromPumpFunAMMEvent(data []byte, baseDecimals, quoteDecimals int) floa
 // extractEventDataForPool returns the raw decoded bytes of the Program data:
 // line that belongs to the swap for the given pool. It finds the data line
 // that immediately precedes or follows the swap instruction for this pool.
+//
+// IMPORTANT: We scan logs in REVERSE order and return the LAST matching event
+// data blob. In a typical swap transaction the SwapEvent is the LAST "Program
+// data:" line emitted. Returning the first match can pick up an auxiliary
+// event (observation update, fee collection, etc.) that shares the same
+// discriminator and pool address but has a different binary layout — producing
+// garbage prices from wrong offset reads.
 func (w *ProgramWatcher) extractEventDataForPool(logs []string, poolAddress string) []byte {
 	// Determine which byte offset the pool pubkey appears at in this program's events.
 	// Most programs (Raydium, Orca, CPMM) use offset 8 (standard Anchor layout).
@@ -789,8 +955,34 @@ func (w *ProgramWatcher) extractEventDataForPool(logs []string, poolAddress stri
 		poolPubkeyOffset = 120
 	}
 
+	// Known swap event discriminators — only accept blobs with these discriminators.
+	// A single transaction emits multiple events (observations, tick updates, etc.)
+	// all containing the pool pubkey. Without discriminator filtering we'd pick up
+	// the FIRST matching blob which may not be the SwapEvent, producing garbage prices.
+	type discEntry struct{ disc [8]byte }
+	var validDiscs []discEntry
+	switch w.programID {
+	case ProgramRaydiumCLMM, ProgramRaydiumAMM, ProgramRaydiumCPMM:
+		// Both CLMM and CPMM share the same SwapEvent discriminator
+		validDiscs = []discEntry{{disc: [8]byte{64, 198, 205, 232, 38, 8, 113, 226}}}
+	case ProgramOrcaWhirlpool:
+		// Orca works correctly without discriminator filtering — skip it.
+		// (sliding window fallback in decodeOrcaPoolFromEventData handles it)
+	case ProgramPumpSwap:
+		// PumpSwap TradeEvent discriminator
+		validDiscs = []discEntry{{disc: [8]byte{189, 219, 127, 211, 78, 230, 97, 238}}}
+	case ProgramPumpFunAMM:
+		// PumpFun AMM BuyEvent and SellEvent discriminators
+		validDiscs = []discEntry{
+			{disc: [8]byte{103, 244, 82, 31, 44, 245, 119, 119}},
+			{disc: [8]byte{62, 47, 55, 10, 165, 3, 220, 42}},
+		}
+	}
+
 	dataLines := 0
-	for _, line := range logs {
+	var lastMatch []byte
+	for i := len(logs) - 1; i >= 0; i-- {
+		line := logs[i]
 		if !strings.Contains(line, "Program data: ") {
 			continue
 		}
@@ -800,19 +992,35 @@ func (w *ProgramWatcher) extractEventDataForPool(logs []string, poolAddress stri
 		if !ok || len(data) < poolPubkeyOffset+32 {
 			continue
 		}
+
+		// If we have known discriminators for this program, reject blobs that
+		// don't match before even checking the pool pubkey. This prevents other
+		// events emitted in the same transaction (observations, ticks, etc.)
+		// from producing garbage prices.
+		if len(validDiscs) > 0 {
+			var blobDisc [8]byte
+			copy(blobDisc[:], data[0:8])
+			matched := false
+			for _, vd := range validDiscs {
+				if blobDisc == vd.disc {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+
 		// Check if this event's pool address matches at the program-specific offset.
 		candidate := encodeBase58(data[poolPubkeyOffset : poolPubkeyOffset+32])
-		log.Printf("[prog/%s] Checking data line %d: candidate=%s, looking_for=%s",
-			shortID(w.programID), dataLines, candidate[:8]+"...", poolAddress[:8]+"...")
 		if strings.EqualFold(candidate, poolAddress) {
-			log.Printf("[prog/%s] MATCH! found event data for %s (scanned %d lines)",
-				shortID(w.programID), poolAddress, dataLines)
-			return data
+			lastMatch = data
+			// Continue scanning — we want the LAST matching event (SwapEvent
+			// is typically the last "Program data:" line in a swap tx).
 		}
 	}
-	log.Printf("[prog/%s] NO MATCH for %s (scanned %d lines, program=%s)",
-		shortID(w.programID), poolAddress, dataLines, w.programID)
-	return nil
+	return lastMatch
 }
 
 // extractPoolAddress parses the transaction logs to find which pool address

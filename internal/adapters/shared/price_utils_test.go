@@ -16,9 +16,19 @@ func TestChooseSanePricePrefersReasonableMagnitude(t *testing.T) {
 }
 
 func TestChooseSanePricePrefersSmallerSaneCandidateForAmbiguousV4Pairs(t *testing.T) {
+    // When both candidates are in the sane range, ChooseSanePrice returns the
+    // FIRST candidate. The caller is responsible for passing the candidates in
+    // the correct order (correct orientation first) — ChooseSanePrice no longer
+    // applies a magnitude heuristic because picking smaller is not reliably correct
+    // (e.g. ETH/USDT: 3500 is the right price, 0.000286 is the wrong inversion).
     got := ChooseSanePrice(9.949, 0.10050886447441296)
-    if got != 0.10050886447441296 {
-        t.Fatalf("expected the smaller sane candidate for ambiguous V4 pricing, got %v", got)
+    if got != 9.949 {
+        t.Fatalf("expected first sane candidate (9.949), got %v", got)
+    }
+    // Verify order matters: passing the smaller one first returns the smaller one.
+    got2 := ChooseSanePrice(0.10050886447441296, 9.949)
+    if got2 != 0.10050886447441296 {
+        t.Fatalf("expected first sane candidate (0.100...) when passed first, got %v", got2)
     }
 }
 

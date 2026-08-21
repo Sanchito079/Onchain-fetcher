@@ -1,6 +1,7 @@
 package raydium
 
 import (
+    "log"
     "math"
     "math/big"
     "strings"
@@ -98,26 +99,87 @@ func (a Adapter) FetchPrice(pair shared.Pair) (shared.PriceResult, error) {
     baseDecimals := shared.ResolveDecimals(onChainBaseDecimals, pair.BaseTokenDecimals)
     quoteDecimals := shared.ResolveDecimals(onChainQuoteDecimals, pair.QuoteTokenDecimals)
 
-    // For Raydium CLMM pools, prefer on-chain sqrt price parsing over
-    // reserve balance extraction. This is more reliable for CLMM/V4 layouts.
-    if strings.Contains(strings.ToLower(strings.TrimSpace(pair.DexName)), "clmm") {
-        if price, ok := parseCLMMPrice(data, pair.BaseToken, pair.QuoteToken, baseDecimals, quoteDecimals, a.RPC.getAccountInfo, token0OrderKnown, token0IsBase); ok {
-            return shared.PriceResult{
-                PairID:    pair.ID,
-                Price:     price,
-                PriceUSD:  price,
-                Valid:     true,
-                Reason:    "ok",
-                FetchedAt: time.Now().UTC(),
-            }, nil
+	// For Raydium CLMM pools, prefer on-chain sqrt price parsing over
+	// reserve balance extraction. This is more reliable for CLMM/V4 layouts.
+	if strings.Contains(strings.ToLower(strings.TrimSpace(pair.DexName)), "clmm") {
+		if price, ok := parseCLMMPrice(data, pair.BaseToken, pair.QuoteToken, baseDecimals, quoteDecimals, a.RPC.getAccountInfo, token0OrderKnown, token0IsBase); ok {
+			// Cross-validate the CLMM sqrt-price against a reserve-based price.
+			// The brute-force scanner in parseCLMMPrice can accidentally match
+			// non-price data (timestamps, fee rates, etc.) as a sqrt price,
+			// producing extreme values like 25626 for a memecoin pair.
+			if rp, rok := calculateCLMMReservePrice(data, pair.BaseToken, pair.QuoteToken, baseDecimals, quoteDecimals, a.RPC.getAccountInfo); rok {
+				if math.Abs(price-rp)/math.Max(math.Abs(rp), 1e-12) > 100 {
+					// CLMM sqrt-price diverges wildly from reserves — reject it
+					// and fall through to the reserve-based calculation below.
+					log.Printf("[raydium] CLMM sqrt-price %.4g rejected (reserve price %.4g, ratio %.1fx) for %s",
+						price, rp, price/rp, pair.PoolAddress)
+				} else {
+					return shared.PriceResult{
+						PairID:    pair.ID,
+						Price:     price,
+						PriceUSD:  price,
+						Valid:     true,
+						Reason:    "ok",
+						FetchedAt: time.Now().UTC(),
+					}, nil
+				}
+			} else {
+				// No reserve price available for cross-validation — accept the CLMM price
+				// if it looks sane (not astronomically large).
+				if price > 0 && price < 1e12 {
+					return shared.PriceResult{
+						PairID:    pair.ID,
+						Price:     price,
+						PriceUSD:  price,
+						Valid:     true,
+						Reason:    "ok",
+						FetchedAt: time.Now().UTC(),
+					}, nil
+				}
+			}
+		}
+	}
+
+    // For CPMM pools: read vault pubkeys directly from pool state at known offsets.
+    // CP Swap PoolState layout (bytemuckunsafe, verified from raydium_cp_swap.json IDL):
+    //   [8:40]    amm_config     pubkey
+    //   [40:72]   pool_creator   pubkey
+    //   [72:104]  token_0_vault  pubkey  ← vault for token_0
+    //   [104:136] token_1_vault  pubkey  ← vault for token_1
+    //   [136:168] lp_mint        pubkey
+    //   [168:200] token_0_mint   pubkey  ← used to confirm orientation
+    //   [200:232] token_1_mint   pubkey
+    var baseBalance, quoteBalance *big.Int
+    if strings.Contains(strings.ToLower(strings.TrimSpace(pair.DexName)), "cpmm") && len(data) >= 232 {
+        vault0Addr := encodeBase58(data[72:104])
+        vault1Addr := encodeBase58(data[104:136])
+        mint0Addr  := encodeBase58(data[168:200])
+        if vault0Addr != "" && vault1Addr != "" && mint0Addr != "" {
+            v0Data, err0 := a.RPC.getAccountInfo(vault0Addr)
+            v1Data, err1 := a.RPC.getAccountInfo(vault1Addr)
+            if err0 == nil && err1 == nil && isLikelyTokenAccount(v0Data) && isLikelyTokenAccount(v1Data) {
+                bal0, e0 := parseTokenAccountBalance(v0Data)
+                bal1, e1 := parseTokenAccountBalance(v1Data)
+                if e0 == nil && e1 == nil && bal0 != nil && bal1 != nil {
+                    // vault0 holds token_0_mint; orient by comparing with DB base token
+                    if strings.EqualFold(mint0Addr, pair.BaseToken) {
+                        baseBalance, quoteBalance = bal0, bal1
+                    } else {
+                        // token_0 is the quote token
+                        baseBalance, quoteBalance = bal1, bal0
+                    }
+                }
+            }
         }
     }
 
-    baseBalance, quoteBalance, err := parsePoolReserves(data, pair.BaseToken, pair.QuoteToken, a.RPC.getAccountInfo)
-    if err != nil {
-        return shared.PriceResult{Valid: false, Reason: err.Error(), PairID: pair.ID}, nil
+    if baseBalance == nil || quoteBalance == nil {
+        var err error
+        baseBalance, quoteBalance, err = parsePoolReserves(data, pair.BaseToken, pair.QuoteToken, a.RPC.getAccountInfo)
+        if err != nil {
+            return shared.PriceResult{Valid: false, Reason: err.Error(), PairID: pair.ID}, nil
+        }
     }
-
     directPrice := calculateSolanaPrice(baseBalance, quoteBalance, baseDecimals, quoteDecimals)
     invertedPrice := calculateSolanaPrice(quoteBalance, baseBalance, quoteDecimals, baseDecimals)
     price := chooseRaydiumPrice(directPrice, invertedPrice)

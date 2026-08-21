@@ -144,35 +144,36 @@ func BuildPriceDebugInfo(pair Pair, strategy string, baseDecimals, quoteDecimals
 }
 
 // ChooseSanePrice selects the most plausible finite, positive candidate.
-// It prefers values within a practical range and, when several positive candidates
-// are plausible, favors the smaller magnitude one to avoid inflated orientation
-// artifacts from V4-style price calculations.
+//
+// Selection strategy (in priority order):
+//  1. Prefer the first candidate that falls inside the "sane" range [1e-18, 1e12].
+//     This is a broad range that covers memecoins (1e-18) through expensive assets
+//     (BTC at ~1e5, a hypothetical asset at 1e12).
+//  2. If no candidate is in range, return the first finite positive value found.
+//  3. Returns 0 if all candidates are zero, negative, NaN, or infinite.
+//
+// We deliberately do NOT prefer smaller values. Choosing the smaller of two
+// sane candidates (e.g. 0.000286 vs 3500) is just as likely to be wrong as
+// choosing the larger one — the correct orientation must be established by
+// the caller (token order resolution), not by magnitude heuristics.
+// When token order is truly unknown the first sane value is the best we can do.
 func ChooseSanePrice(candidates ...float64) float64 {
-	var best float64
-	var found bool
+	var firstPositive float64
 	for _, candidate := range candidates {
 		if candidate <= 0 || math.IsNaN(candidate) || math.IsInf(candidate, 0) {
 			continue
 		}
-		if !found {
-			best = candidate
-			found = true
-			continue
+		// Track the first positive finite value as ultimate fallback.
+		if firstPositive == 0 {
+			firstPositive = candidate
 		}
-		if math.Abs(candidate) >= 1e-6 && math.Abs(candidate) <= 1e12 {
-			if math.Abs(best) < 1e-6 || math.Abs(best) > 1e12 || math.Abs(candidate) < math.Abs(best) {
-				best = candidate
-			}
-			continue
-		}
-		if math.Abs(best) < 1e-6 || math.Abs(best) > 1e12 {
-			best = candidate
+		// Return the first candidate that is within a practical sane range.
+		if candidate >= 1e-18 && candidate <= 1e12 {
+			return candidate
 		}
 	}
-	if !found {
-		return 0
-	}
-	return best
+	// No in-range candidate found — return first positive finite value (or 0).
+	return firstPositive
 }
 
 // Adapter defines the contract for a DEX-specific price fetcher.

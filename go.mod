@@ -10,6 +10,7 @@ require (
 require github.com/gorilla/websocket v1.5.3
 
 require (
+	github.com/joho/godotenv v1.5.1 // indirect
 	github.com/mr-tron/base58 v1.3.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
