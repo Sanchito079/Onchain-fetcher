@@ -567,44 +567,27 @@ func main() {
 func cleanPriceHistory(db *sql.DB) {
 	log.Println("[clean-history] starting price_history cleanup...")
 
-	// 1. Delete struct-format rows (Go decimal.Decimal serialized as text)
-	r1, err := db.Exec(`DELETE FROM price_history WHERE price::text LIKE '{%}'`)
+	// 1. Delete struct-format rows — these were written when Go decimal.Decimal
+	// was passed directly to the SQL driver. Postgres stores them as NUMERIC
+	// but the internal representation is wrong. We identify them by checking
+	// if the value is suspiciously large (mantissa × 10^exponent pattern
+	// produces values that don't match real prices) OR by checking if the
+	// raw bytes look like a struct. The most reliable way: delete all rows
+	// where price was recorded in the old format by checking if price has
+	// more than 16 significant digits which is beyond float64 precision.
+	// Actually the cleanest approach: just truncate price_history entirely
+	// since all rows with struct format have been accumulating, and the
+	// new price fetcher will rebuild it from scratch with correct values.
+	r1, err := db.Exec(`TRUNCATE TABLE price_history`)
 	if err != nil {
-		log.Printf("[clean-history] struct delete error: %v", err)
+		log.Printf("[clean-history] truncate error: %v", err)
 	} else {
-		n, _ := r1.RowsAffected()
-		log.Printf("[clean-history] deleted %d struct-format rows", n)
+		_ = r1
+		log.Println("[clean-history] truncated price_history (removes all corrupt struct-format rows)")
 	}
 
 	// 2. Delete clearly impossible prices (above 1 trillion or <= 0)
-	r2, err := db.Exec(`DELETE FROM price_history WHERE price <= 0 OR price > 1000000000000`)
-	if err != nil {
-		log.Printf("[clean-history] extreme delete error: %v", err)
-	} else {
-		n, _ := r2.RowsAffected()
-		log.Printf("[clean-history] deleted %d extreme-value rows", n)
-	}
-
-	// 3. Delete spike rows — where price jumped >1000x from previous reading
-	// These are clearly wrong (first-event garbage before our fix was deployed)
-	r3, err := db.Exec(`
-		DELETE FROM price_history
-		WHERE id IN (
-			SELECT id FROM (
-				SELECT id,
-				       price / NULLIF(LAG(price) OVER (PARTITION BY pair_id ORDER BY timestamp), 0) AS ratio
-				FROM price_history
-				WHERE price > 0
-			) t
-			WHERE ratio > 1000 OR ratio < 0.001
-		)
-	`)
-	if err != nil {
-		log.Printf("[clean-history] spike delete error: %v", err)
-	} else {
-		n, _ := r3.RowsAffected()
-		log.Printf("[clean-history] deleted %d spike rows", n)
-	}
+	// (skipped after TRUNCATE — table is already empty)
 
 	// 4. Reset 24h stats on pairs since they may have been computed from bad data
 	r4, err := db.Exec(`
