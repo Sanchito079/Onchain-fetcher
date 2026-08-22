@@ -13,6 +13,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -92,8 +93,10 @@ func toWSS(endpoint string) string {
 }
 
 func main() {
+	cleanHistory := flag.Bool("clean-history", false, "delete corrupt/spike price_history rows then exit")
+	flag.Parse()
+
 	// Load .env from working directory if present.
-	// Real environment variables always take precedence over .env values.
 	if err := godotenv.Load(); err != nil {
 		log.Println("[config] no .env file found, using environment variables")
 	} else {
@@ -101,6 +104,20 @@ func main() {
 	}
 
 	dsn := getEnv("DATABASE_URL", "postgres://postgres:postgres@127.0.0.1:55422/postgres?sslmode=disable")
+	db, err := sql.Open("postgres", dsn)
+	if err != nil { log.Fatalf("[db] open: %v", err) }
+	defer db.Close()
+	for i := 1; i <= 5; i++ {
+		if err := db.Ping(); err == nil { break }
+		if i == 5 { log.Fatal("[db] cannot connect") }
+		time.Sleep(3 * time.Second)
+	}
+	log.Println("[db] connected")
+
+	if *cleanHistory {
+		cleanPriceHistory(db)
+		return
+	}
 
 	// Initialize JSONL price hit logger
 	priceLogger, err := NewJSONLLogger("watcher_price_hits.jsonl")
@@ -180,29 +197,6 @@ func main() {
 		log.Printf("[db] DATABASE_URL is set (length=%d)", len(rawURL))
 	}
 	log.Printf("[db] connecting with DSN length=%d", len(dsn))
-
-	db, err := sql.Open("postgres", dsn)
-	if err != nil {
-		log.Fatalf("[db] sql.Open failed: %v", err)
-	}
-	defer db.Close()
-
-	// Retry db.Ping up to 5 times with backoff — fly.io internal DNS sometimes
-	// takes a few seconds to resolve on first boot.
-	connected := false
-	for attempt := 1; attempt <= 5; attempt++ {
-		if err := db.Ping(); err != nil {
-			log.Printf("[db] ping attempt %d/5 failed: %v — retrying in 3s", attempt, err)
-			time.Sleep(3 * time.Second)
-			continue
-		}
-		connected = true
-		break
-	}
-	if !connected {
-		log.Fatal("[db] could not connect to database after 5 attempts — check DATABASE_URL secret")
-	}
-	log.Println("[db] Connected to database")
 
 	// ── Adapters (HTTP) ───────────────────────────────────────────────────────
 	// EVM adapters are created on-the-fly per call in evmFetch (round-robin),
@@ -566,4 +560,71 @@ func main() {
 
 	// Keep alive - wait for interrupt instead of polling
 	select {}
+}
+
+// cleanPriceHistory removes corrupt struct-format rows and spike entries from price_history.
+// Run with: go run ./cmd/watcher -clean-history
+func cleanPriceHistory(db *sql.DB) {
+	log.Println("[clean-history] starting price_history cleanup...")
+
+	// 1. Delete struct-format rows (Go decimal.Decimal serialized as text)
+	r1, err := db.Exec(`DELETE FROM price_history WHERE price::text LIKE '{%}'`)
+	if err != nil {
+		log.Printf("[clean-history] struct delete error: %v", err)
+	} else {
+		n, _ := r1.RowsAffected()
+		log.Printf("[clean-history] deleted %d struct-format rows", n)
+	}
+
+	// 2. Delete clearly impossible prices (above 1 trillion or <= 0)
+	r2, err := db.Exec(`DELETE FROM price_history WHERE price <= 0 OR price > 1000000000000`)
+	if err != nil {
+		log.Printf("[clean-history] extreme delete error: %v", err)
+	} else {
+		n, _ := r2.RowsAffected()
+		log.Printf("[clean-history] deleted %d extreme-value rows", n)
+	}
+
+	// 3. Delete spike rows — where price jumped >1000x from previous reading
+	// These are clearly wrong (first-event garbage before our fix was deployed)
+	r3, err := db.Exec(`
+		DELETE FROM price_history
+		WHERE id IN (
+			SELECT id FROM (
+				SELECT id,
+				       price / NULLIF(LAG(price) OVER (PARTITION BY pair_id ORDER BY timestamp), 0) AS ratio
+				FROM price_history
+				WHERE price > 0
+			) t
+			WHERE ratio > 1000 OR ratio < 0.001
+		)
+	`)
+	if err != nil {
+		log.Printf("[clean-history] spike delete error: %v", err)
+	} else {
+		n, _ := r3.RowsAffected()
+		log.Printf("[clean-history] deleted %d spike rows", n)
+	}
+
+	// 4. Reset 24h stats on pairs since they may have been computed from bad data
+	r4, err := db.Exec(`
+		UPDATE pairs SET
+			gecko_high_24h         = gecko_price,
+			gecko_low_24h          = gecko_price,
+			gecko_price_change_24h = 0
+		WHERE gecko_price IS NOT NULL
+		  AND gecko_price > 0
+		  AND gecko_price < 1000000000000
+	`)
+	if err != nil {
+		log.Printf("[clean-history] pairs reset error: %v", err)
+	} else {
+		n, _ := r4.RowsAffected()
+		log.Printf("[clean-history] reset 24h stats on %d pairs", n)
+	}
+
+	// 5. Final count
+	var remaining int
+	db.QueryRow("SELECT COUNT(*) FROM price_history").Scan(&remaining)
+	log.Printf("[clean-history] done — %d clean rows remain in price_history", remaining)
 }
