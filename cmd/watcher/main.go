@@ -94,6 +94,7 @@ func toWSS(endpoint string) string {
 
 func main() {
 	cleanHistory := flag.Bool("clean-history", false, "delete corrupt/spike price_history rows then exit")
+	clearPairs   := flag.Bool("clear-pairs",   false, "delete all pairs from DB then exit")
 	flag.Parse()
 
 	// Load .env from working directory if present.
@@ -116,6 +117,16 @@ func main() {
 
 	if *cleanHistory {
 		cleanPriceHistory(db)
+		return
+	}
+
+	if *clearPairs {
+		res, err := db.Exec(`DELETE FROM pairs`)
+		if err != nil {
+			log.Fatalf("[clear-pairs] failed: %v", err)
+		}
+		n, _ := res.RowsAffected()
+		log.Printf("[clear-pairs] deleted %d pairs", n)
 		return
 	}
 
