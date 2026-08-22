@@ -578,12 +578,12 @@ func cleanPriceHistory(db *sql.DB) {
 	// Actually the cleanest approach: just truncate price_history entirely
 	// since all rows with struct format have been accumulating, and the
 	// new price fetcher will rebuild it from scratch with correct values.
-	r1, err := db.Exec(`TRUNCATE TABLE price_history`)
+	r1, err := db.Exec(`DELETE FROM price_history`)
 	if err != nil {
-		log.Printf("[clean-history] truncate error: %v", err)
+		log.Printf("[clean-history] delete-all error: %v", err)
 	} else {
 		_ = r1
-		log.Println("[clean-history] truncated price_history (removes all corrupt struct-format rows)")
+		log.Println("[clean-history] deleted all price_history rows (rebuilds from clean data)")
 	}
 
 	// 2. Delete clearly impossible prices (above 1 trillion or <= 0)
