@@ -158,6 +158,18 @@ func main() {
 		"wss://solana-mainnet.core.chainstack.com/49074bea8522c7e9a1e16b9d971842cf",
 		"wss://solana-mainnet.core.chainstack.com/54ce8267c02c230db8cf40ae8c432e1e",
 		"wss://solana-mainnet.core.chainstack.com/d367c1187485443d0f826f06ff52c072",
+		"wss://solana-mainnet.core.chainstack.com/7c901a2037344a3dee52cea30de1a3af",
+		"wss://solana-mainnet.core.chainstack.com/af341bf515f50441e681b8d0dacde199",
+		"wss://solana-mainnet.core.chainstack.com/56c08c0c305c150b25ed33912b2b2946",
+	}
+	// Allow extra WS endpoints from env (comma-separated) to be injected at runtime
+	if extra := strings.TrimSpace(getEnv("RPC_WS_SOLANA_EXTRA", "")); extra != "" {
+		for _, ep := range strings.Split(extra, ",") {
+			ep = strings.TrimSpace(ep)
+			if ep != "" {
+				solanaWSEndpoints = append(solanaWSEndpoints, ep)
+			}
+		}
 	}
 
 	// ── BSC endpoints ─────────────────────────────────────────────────────────
